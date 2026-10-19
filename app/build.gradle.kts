@@ -1,0 +1,975 @@
+import com.android.build.api.variant.BuildConfigField
+import org.jlleitschuh.gradle.ktlint.reporter.ReporterType
+import java.io.ByteArrayOutputStream
+import java.util.Properties
+import javax.inject.Inject
+
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.kover) // test coverage — instruments bytecode + hooks the test run
+    alias(libs.plugins.detekt) // static analysis (dev.detekt)
+    alias(libs.plugins.ktlint) // Kotlin style/format lint (ktlintCheck / ktlintFormat)
+    alias(libs.plugins.androidx.room) // Room 3 schema export (room3 { schemaDirectory(…) } below)
+    alias(libs.plugins.compose.screenshot) // Compose Preview Screenshot Testing (src/screenshotTest/, alpha)
+}
+
+// Release signing credentials. Loaded from a gitignored keystore.properties at the repo root, falling back
+// to env vars (CI). Absent creds → the release build is left unsigned (see android.signingConfigs), so
+// assembleRelease still runs without secrets — which is also exactly what F-Droid's buildserver produces.
+// Never commit a key.
+//
+// This config is credential-GENERIC and serves two distinct signing identities: the Play *upload* key for
+// `bundleRelease`, and the public distribution key for the `assembleRelease` APK that F-Droid verifies and
+// redistributes. You pick one by which keystore the credentials point at; the build never sees both. See
+// keystore.properties.example and .agents/context/distribution.md.
+val keystoreProps =
+    Properties().apply {
+        val f = rootProject.file("keystore.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+
+// Env fallback accepts KNIT_SIGNING_* (identity-neutral, preferred) before the original KNIT_UPLOAD_*
+// names. Both still work; the rename exists because "UPLOAD" is actively misleading for the identity that
+// matters most — .github/workflows/release.yml feeds this the *distribution* key, whose certificate is
+// pinned forever in fdroiddata. Signing the public APK with the Play upload key by mistake is the one
+// unrecoverable error here, so the variable shouldn't be named after the wrong key.
+fun releaseSigningCred(
+    prop: String,
+    envSuffix: String,
+): String? =
+    (
+        keystoreProps.getProperty(prop)
+            ?: System.getenv("KNIT_SIGNING_$envSuffix")
+            ?: System.getenv("KNIT_UPLOAD_$envSuffix")
+    )?.takeIf { it.isNotBlank() }
+
+// Native-symbol extraction: ON by default for the **AAB** (Play) path, OFF for the **APK** (F-Droid) path.
+//
+// It is the one part of the release build that depends on a tool outside the Gradle/AGP pin — the NDK's
+// llvm-objcopy/llvm-strip — and AGP degrades SILENTLY when the NDK is absent (it warns and ships the
+// prebuilt .so unstripped). That makes the output bytes a function of the *build machine*, which breaks
+// the F-Droid reproducible-build contract: F-Droid rebuilds this commit on their buildserver — which has
+// no NDK, and no `ndk:` line in .fdroid.yml — and byte-compares against the APK we publish, so "stripped
+// here, unstripped there" is a verification failure.
+//
+// Hence the split rather than a global default. Symbols ride in the AAB's BUNDLE-METADATA and never enter
+// an APK, so turning them on for `bundle*` costs the APK nothing, while `assembleRelease` stays NDK-free
+// and byte-identical on every machine (see packaging.jniLibs below). Keying off the requested task is what
+// makes that automatic: the Play AAB is cut by hand, and 2.2.2/vc11 shipped to open testing with **zero**
+// debug symbols because the flag was forgotten — the silent-degradation failure mode, one level up.
+//
+// `-Pknit.nativeSymbols=<bool>` still overrides in either direction: force it off for a bundle on a
+// machine with no NDK, or on for an APK build (don't — it un-pins the APK from the no-strip path).
+// startParameter is part of the configuration-cache key, so this re-resolves when the task list changes.
+val bundleRequested = gradle.startParameter.taskNames.any { it.contains("bundle", ignoreCase = true) }
+val nativeSymbols = (project.findProperty("knit.nativeSymbols") as? String)?.toBoolean() ?: bundleRequested
+
+// Internet (spool) relay plane — the whole feature's visibility switch, read here because both
+// defaultConfig and buildTypes.release need it. Null means "no opinion", which resolves to ON
+// everywhere as of 2.4.0 (ADR 064 — the feature is introduced, so the switch it hid is now the user's
+// own, not the build's); `-PinternetPlane=true|false` overrides either way. See the BuildConfig fields
+// below for what the flag actually gates, and note that ON here means *visible and reachable*, never
+// *enabled*: `SettingsStore.spoolEnabled` still defaults false behind a consent sheet.
+val internetPlane = (project.findProperty("internetPlane") as? String)?.toBoolean()
+
+// LoRa (Meshtastic-over-BLE) plane — the same kind of visibility switch, now ON everywhere as of 2.5.0
+// (ADR 2026-09.6gtm), overridable with `-PloraPlane=true|false`. It gates the LoRa child in the composite
+// transport, the settings screen + its route, and SettingsStore.loraEnabled. Not a code strip (R8 prunes
+// the `if (LORA_PLANE)` branches); the default lives in source so F-Droid's -P-free rebuild stays identical.
+// ON means *visible and reachable*, never *enabled*: `SettingsStore.loraEnabled` still defaults false, and
+// a board has to be paired and set up before a single frame leaves over the radio.
+val loraPlane = (project.findProperty("loraPlane") as? String)?.toBoolean()
+
+// The commons (a private relay's group chat, ADR 2026-09.wx8e, spec §7.4) — the same kind of visibility
+// switch at the start of its life: ON in debug, OFF in a shipped artifact, overridable with
+// `-Pcommons=true|false`. It gates the store the mesh and the relay editor are handed (`CommonsStore`
+// stays null, so no room is ever subscribed, posted to or listed), the relay row's Join / Leave line, and
+// the room's notification channel. Not a code strip (R8 prunes the `if (COMMONS)` branches), and the
+// defaults live in source so F-Droid's -P-free rebuild stays identical. Flip the release default to ON
+// when the feature is introduced, the way ADR 064 and ADR 2026-09.6gtm did for the two planes.
+val commons = (project.findProperty("commons") as? String)?.toBoolean()
+
+// The BLE side channel (small floodable frames on non-connectable extended-advertising pages, knit/knit-next#13)
+// — the same kind of visibility switch: ON in debug and in a shipped artifact,
+// overridable with `-PbleSidePlane=true|false`. It gates the one seam, the `BleSideChannel` the DI hands
+// `BluetoothMeshTransport` (null while dark: no page is ever aired or listened for, and the presence advert
+// carries no flag). Not a code strip (R8 prunes the `if (BLE_SIDE_PLANE)` branch), and the defaults live in
+// source so F-Droid's -P-free rebuild stays identical.
+val bleSidePlane = (project.findProperty("bleSidePlane") as? String)?.toBoolean()
+
+// Finding an iPhone through its GATT payload (companion change A3, knit-next#101): a foreground iPhone advertises
+// only the 0xFE30 UUID, so the presence scan also matches that UUID, reads the peer's payload characteristic, and
+// the advert sets FLAG_DIALS_GATT_PEERS so a lower-id iPhone waits to be dialed. ON in debug and in a shipped
+// artifact, overridable with `-PbleGattPeers=true|false`. It gates the reader, the second scan filter and the flag
+// together — a flag without a reader strands the pair. Not a code strip, and the defaults live in source so
+// F-Droid's -P-free rebuild stays identical.
+val bleGattPeers = (project.findProperty("bleGattPeers") as? String)?.toBoolean()
+
+// Asking neighbours which of them holds a blob before asking one for it (`blobhave`/`blobhas`, ADR 2026-10.6e5t):
+// ON in debug and in a shipped artifact, overridable with `-PblobQuery=true|false`. It gates the asking only — every
+// build advertises CAP_BLOB_HAVE and answers a query, so a mixed fleet works.
+// Off, every neighbour gets ADR 2026-10.f7gg's blind round. Not a code strip, and the defaults live in source so
+// F-Droid's -P-free rebuild stays identical.
+val blobQuery = (project.findProperty("blobQuery") as? String)?.toBoolean()
+
+// The BLE Coded PHY experiment (long range, getknit/knit#29, ADR 2026-10.yvn6): a second presence set on the Coded
+// PHY, an all-PHY presence scan, and per-link steps between 1M and Coded S=8 — ON in debug and in a shipped
+// artifact, overridable with `-PbleCodedPhy=true|false`. It gates the one seam, the mode flow the DI hands
+// `BluetoothMeshTransport` (OFF while dark: no Coded set, the legacy scan, no PHY handle), and the Diagnostics row
+// and `…debug.PHY` that set the mode. Not a code strip, and the defaults live in source so F-Droid's -P-free rebuild
+// stays identical.
+val bleCodedPhy = (project.findProperty("bleCodedPhy") as? String)?.toBoolean()
+
+// The Bluetooth link boost (knit-next#120): a link feeding a file asks for CONNECTION_PRIORITY_HIGH through a GATT
+// client on its own ACL, and the 1M/2M file budget rises while every feeding link reports the short interval — ON in
+// debug and in a shipped artifact, overridable with `-PbleLinkBoost=true|false`. Off, no link opens a client for it
+// and every feed keeps the base budget. Not a code strip, and the defaults live in source so F-Droid's -P-free rebuild
+// stays identical.
+val bleLinkBoost = (project.findProperty("bleLinkBoost") as? String)?.toBoolean()
+
+// The Bluetooth feed window (ADR 2026-10.nsr7's phase 2): a file to an Android peer that reports its progress is
+// clocked by those reports, keeping about half a second queued ahead of the receiver, instead of the fixed pace
+// budgets — ON in debug and in a shipped artifact, overridable with `-PbleFeedWindow=true|false`, and switchable at
+// run time on a debug build (`…debug.LINKTUNE --es feed window|pace`). Not a code strip, and the defaults live in
+// source so F-Droid's -P-free rebuild stays identical.
+val bleFeedWindow = (project.findProperty("bleFeedWindow") as? String)?.toBoolean()
+
+// The Wear OS status service (a read-only GATT characteristic a bonded watch reads the mesh state from; the
+// watch app is the opt-in `:wear` module) — a prototype: ON in debug, OFF in a shipped artifact, overridable
+// with `-PwearStatus=true|false`. It gates the one seam, the `WearStatusServer` definition in the DI graph
+// (absent while dark, so `MeshService` opens no GATT server). Not a code strip (R8 prunes the
+// `if (WEAR_STATUS)` branch), and the defaults live in source so F-Droid's -P-free rebuild stays identical.
+val wearStatus = (project.findProperty("wearStatus") as? String)?.toBoolean()
+
+// ABIs packaged into the **debug** APK. Debug is unminified and carries both tflite models, so it is
+// ~150 MB before native libs; the four-ABI default adds ~28 MB more, of which the two 32-bit slices are
+// dead weight — every lab Pixel is arm64-v8a and every Gradle-managed emulator image is x86_64, so
+// nothing we install on locally runs x86 or armeabi-v7a (the FTL runner adds armeabi-v7a back for its
+// 32-bit API-29 device). Dropping them saves ~12 MB per install, which is real
+// time on a lab device whose adb link is slow (a phone associated to 2.4 GHz pushes ~0.5 MB/s, vs
+// ~40 MB/s on 5 GHz — that ratio is what makes debug APK size worth caring about at all).
+//
+// **x86_64 must stay**: `pixel7api33`/`pixel8api34` are x86_64 system images, and SQLCipher is loaded via
+// System.loadLibrary at DB open, so stripping it fails every instrumented test at the first Room access.
+// `-Pknit.debugAbis=arm64-v8a` narrows further for a device-only reflash (another ~8 MB); pass an empty
+// value to package every ABI, as an unfiltered build would.
+//
+// Scoped to the debug build type on purpose. This is a *packaging filter*, not the NDK toolchain
+// (`abiFilters` needs no NDK installed, unlike `ndk { debugSymbolLevel }`), but release-APK bytes are
+// byte-compared by F-Droid — so release and staging keep every ABI and are untouched by this.
+// See `.agents/context/distribution.md`.
+val debugAbis =
+    ((project.findProperty("knit.debugAbis") as? String) ?: "arm64-v8a,x86_64")
+        .split(",")
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+
+android {
+    namespace = "app.getknit.knit"
+    // Turns on the `screenshotTest` source set for the Compose Preview Screenshot Testing plugin (the
+    // gradle.properties flag of the same name is the other half). See .agents/context/testing.md.
+    experimentalProperties["android.experimental.enableScreenshotTest"] = true
+    // API 37.1. Bumped off 36.1 to clear the `minCompileSdk=37` gate that androidx started shipping
+    // (core-ktx 1.19.0, lifecycle 2.11.0, Compose UI 1.12.0, okhttp-android 5.5.0 all declare it), which
+    // any 37.x satisfies. compileSdk only sets which APIs are *visible* to the compiler — runtime behavior
+    // is `targetSdk`, deliberately left at 36, so this carries no behavior-change or Play-policy
+    // consequence. Lint's NewApi still guards every call against minSdk 29.
+    //
+    // DO NOT bump the minor (or buildToolsVersion below) without checking F-Droid first. Their buildserver
+    // installs SDK packages through f-droid/android-sdk-transparency-log, and a package Google publishes
+    // but that log does not carry does not exist there — a release blocker, not a warning. 37.1 shipped
+    // that way in 2026-08 (`Failed to find package 'platforms;android-37.1'`; 6407e7d reverted it, and
+    // the release workflow's reproducibility job is what caught it) and came back on 2026-09-15 once the
+    // image resolved it. Test in the image itself, not the log's JSON, which the image lags:
+    //   docker run --rm registry.gitlab.com/fdroid/fdroidserver:buildserver \
+    //     sdkmanager --install "platforms;android-37.1" "build-tools;37.0.0"
+    // then mirror the bump into qodana.yaml and .github/workflows/release.yml.
+    // See .agents/context/distribution.md.
+    compileSdk {
+        version =
+            release(37) {
+                minorApiLevel = 1
+            }
+    }
+    // Build-tools 37.0.0, above AGP 9.4.1's 36.0.0 default. AGP takes aapt2, d8/r8 and apksig from Maven,
+    // so this revision decides no packaged byte (verified: the unsigned release APK is identical under
+    // 36.0.0 and 37.0.0); it is pinned so every builder — both CIs, Qodana and F-Droid's image — installs
+    // the one package the build will use instead of whatever AGP would auto-download.
+    buildToolsVersion = "37.0.0"
+
+    // Pinned ONLY to run llvm-objcopy for release native-symbol extraction (see debugSymbolLevel in
+    // buildTypes) — this app compiles no native code, so the exact version is not correctness-sensitive;
+    // any recent NDK extracts the same .dynsym. It's pinned for reproducibility and because a missing NDK
+    // fails SILENTLY (empty symbols, no build error). BUMP POLICY: only in lockstep with an AGP upgrade,
+    // to AGP's new *default* NDK (AGP release notes → "Default NDK version"; a stale/missing pin also shows
+    // up as an `android.ndkVersion …` build warning). Don't chase NDK releases on their own cadence — with
+    // no native build there's nothing to gain. After bumping: `sdkmanager "ndk;<ver>"` on every build
+    // machine + CI, then re-verify the .sym files land in the AAB's BUNDLE-METADATA (the failure is silent).
+    // Set ONLY on the AAB path (any `bundle*` task, or -Pknit.nativeSymbols=true) so an APK build needs no
+    // NDK at all — see the nativeSymbols comment above the android block.
+    if (nativeSymbols) ndkVersion = "28.2.13676358"
+
+    defaultConfig {
+        applicationId = "app.lifeline"
+        // minSdk 29 is the shared data-path floor: BLE L2CAP CoC and the Wi-Fi Aware NDP
+        // (WifiAwareNetworkSpecifier.Builder) are both API 29. Both radios run on 29+. Wi-Fi Aware uses
+        // Instant Communication Mode + NEARBY_WIFI_DEVICES on 33+ and ACCESS_FINE_LOCATION (no ICM) on 29-32;
+        // BLE uses the split BLUETOOTH_* perms on 31+ and legacy BLUETOOTH/BLUETOOTH_ADMIN on 29-30. Location
+        // is confined to 29-32 (maxSdkVersion 32); 33+ stays location-free.
+        minSdk = 29
+        targetSdk = 36
+        // Single source of truth in gradle.properties (knit.versionCode / knit.versionName). Play App
+        // Signing requires versionCode to strictly increase per upload — CI can inject a monotonic value
+        // with `-Pknit.versionCode=$CI_PIPELINE_IID` without editing this file.
+        versionCode = providers.gradleProperty("knit.versionCode").get().toInt()
+        versionName = providers.gradleProperty("knit.versionName").get()
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Android Test Orchestrator isolation: wipe app data (identity keystore + SQLCipher DB + DataStore)
+        // between instrumentation tests so each test re-generates a fresh identity and re-seeds a clean demo
+        // DB. Paired with testOptions.execution below; on Firebase Test Lab pass the same via
+        // `--use-orchestrator --environment-variables clearPackageData=true` (see .agents/context/testing.md).
+        testInstrumentationRunnerArguments["clearPackageData"] = "true"
+        // TestStorage output (the a11y reports, test screenshots): AGP creates the test-services output
+        // directory before the run and pulls it into additional_test_output after. Without it every
+        // TestStorage.openOutputFile fails locally with "No parent directory"; FTL provides its own.
+        testInstrumentationRunnerArguments["useTestStorageService"] = "true"
+
+        // Demo-screenshot mode: when built with `-PseedDemo=true`, the app seeds a realistic data set
+        // and swaps in a no-op transport so every screen renders populated on an emulator (no real
+        // mesh). Defaults false, so release/normal builds are unaffected. See DemoSeeder/DemoTransport.
+        // Demo-trailer mode: `-PdemoDirector=true` plays a scripted, animated conversation (the promo
+        // trailer) instead of the static screenshot seed. It IMPLIES seedDemo — it reuses every demo seam
+        // (no-op transport, permission-gate skip, no MeshService, `demo_route`) — so turning it on lights
+        // those up for free. Debug-only; the director + seeder live in src/debug (see DemoWiring).
+        val demoDirector = (project.findProperty("demoDirector") as? String)?.toBoolean() == true
+        val seedDemo = (project.findProperty("seedDemo") as? String)?.toBoolean() == true || demoDirector
+        buildConfigField("boolean", "SEED_DEMO", seedDemo.toString())
+        buildConfigField("boolean", "DEMO_DIRECTOR", demoDirector.toString())
+        // Which seed scenario DemoSeeder/DemoDirector loads: "hiking" (default) or "festival". Only meaningful
+        // when seedDemo is on; picks the persona/message/avatar set so we can shoot multiple marketing themes.
+        val demoTheme = (project.findProperty("demoTheme") as? String) ?: "hiking"
+        buildConfigField("String", "DEMO_THEME", "\"$demoTheme\"")
+        // Internet (spool) relay plane — the whole feature's visibility switch, ON here and, since
+        // 2.4.0, in release too (ADR 064); `-PinternetPlane=true|false` overrides either way. What it
+        // gates is every way *in*: the Profile row and its `relays` route, the shipped default spool's
+        // one-shot seed, and `SettingsStore.spoolEnabled`, which reads false no matter what the stored
+        // preference says while the flag is off — which parks `ScopeSync` (no socket), stops group-root
+        // minting, and collapses every derived indicator (header cloud, per-chat relay notice, "nearby
+        // only" attachment markers) to their off states, because all of them are already functions of
+        // that one flow. Deliberately NOT a code strip: the classes stay in the APK (R8 only prunes the
+        // `if (INTERNET_PLANE)` branches), which is what let the plane sit finished-but-dark for two
+        // releases and kept the unit suite — which builds debug, so the flag is true — running the real
+        // thing throughout. Both defaults live in source (the `?:` fallbacks below) rather than in
+        // gradle.properties or CI, so F-Droid's rebuild — which passes no `-P` — resolves the same
+        // values we shipped and stays byte-identical.
+        //
+        // ON is not the same as enabled. The user's own switch (`SettingsStore.spoolEnabled`, behind the
+        // consent sheet) still defaults false, so a fresh 2.4.0 install seeds the default relay, shows
+        // the screen, and opens no socket until someone says so.
+        buildConfigField("boolean", "INTERNET_PLANE", (internetPlane ?: true).toString())
+        buildConfigField("boolean", "LORA_PLANE", (loraPlane ?: true).toString())
+        // The commons is ON here so the unit suite and the lab run the real thing; see `commons` above.
+        buildConfigField("boolean", "COMMONS", (commons ?: true).toString())
+        // The BLE side channel is ON in debug so a lab build airs and hears pages; see `bleSidePlane` above.
+        buildConfigField("boolean", "BLE_SIDE_PLANE", (bleSidePlane ?: true).toString())
+        // The GATT payload reader is ON in debug so a lab build finds and dials iPhones; see `bleGattPeers` above.
+        buildConfigField("boolean", "BLE_GATT_PEERS", (bleGattPeers ?: true).toString())
+        // Querying neighbours for a blob's holders is ON in debug so a lab build asks the best one; see `blobQuery` above.
+        buildConfigField("boolean", "BLOB_QUERY", (blobQuery ?: true).toString())
+        // The Coded PHY experiment is ON in debug so a lab build can be walk-tested; see `bleCodedPhy` above.
+        buildConfigField("boolean", "BLE_CODED_PHY", (bleCodedPhy ?: true).toString())
+        // The Bluetooth link boost is ON in debug so a lab build asks for HIGH while it feeds; see `bleLinkBoost` above.
+        buildConfigField("boolean", "BLE_LINK_BOOST", (bleLinkBoost ?: true).toString())
+        // The Bluetooth feed window is ON in debug so a lab build feeds by its receiver's reports; see `bleFeedWindow` above.
+        buildConfigField("boolean", "BLE_FEED_WINDOW", (bleFeedWindow ?: true).toString())
+        // The Wear OS status service is ON in debug so a lab phone serves a paired watch; see `wearStatus` above.
+        buildConfigField("boolean", "WEAR_STATUS", (wearStatus ?: true).toString())
+        // Fault injection for the model poison-pill's acceptance test (ADR 037):
+        // `-PmodelFaultOnLoad=segv` raises SIGSEGV, `=kill` sends SIGKILL, inside ModelLoadGuard right
+        // after the in-flight marker is durably written. They test opposite things: only `segv` produces
+        // the native-crash evidence that latches, while `kill` is the negative control — SIGKILL is
+        // recorded exactly as a force-stop is, so it must never latch. Empty (off) by default,
+        // read only behind `if (BuildConfig.DEBUG)` so R8 folds it out, and forced off in release below.
+        // The default lives here in source, not in gradle.properties, so F-Droid's rebuild — which
+        // passes no `-P` — resolves the same OFF and stays byte-identical.
+        val modelFaultOnLoad = (project.findProperty("modelFaultOnLoad") as? String).orEmpty()
+        buildConfigField("String", "MODEL_FAULT_ON_LOAD", "\"$modelFaultOnLoad\"")
+        // The checkout's short commit, shown in About. Empty here on purpose: only the debug variant fills
+        // it (`androidComponents` below), so a release APK never carries the build machine's Git state.
+        buildConfigField("String", "GIT_SHA", "\"\"")
+    }
+
+    signingConfigs {
+        // Release signing — Play upload key or the public distribution key, depending on which keystore the
+        // creds point at (see the loader above the android block). Missing creds → no "release" config is
+        // created and the release build stays UNSIGNED, so assembleRelease still runs (and exercises R8)
+        // without secrets; a key is only needed to install on a device, upload to Play, or publish a
+        // GitHub Release. v1..v4 signing stay at AGP defaults, correct for both identities.
+        val store = releaseSigningCred("storeFile", "STORE_FILE")
+        val storePass = releaseSigningCred("storePassword", "STORE_PASSWORD")
+        val alias = releaseSigningCred("keyAlias", "KEY_ALIAS")
+        val keyPass = releaseSigningCred("keyPassword", "KEY_PASSWORD")
+        if (store != null && storePass != null && alias != null && keyPass != null) {
+            create("release") {
+                storeFile = file(store)
+                storePassword = storePass
+                keyAlias = alias
+                keyPassword = keyPass
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            // R8: shrink + optimize + OBFUSCATE (name mangling), plus unused-resource shrinking. Keep rules
+            // are auto-combined from src/main/keepRules/*.keep (AGP merges them; no proguardFiles wiring
+            // needed). The wire protocol survives renaming because it's kotlinx.serialization compiler-plugin
+            // CBOR/JSON — map keys are baked $$serializer descriptor string literals R8 doesn't rewrite — and
+            // the frozen wire/identity DTOs are pinned unrenamed in knit-r8.keep; the fail-silent reflection
+            // surfaces (Tink, the tflite moderators, SQLCipher) are kept there too. isMinifyEnabled is the
+            // standard R8 switch (the previous `optimization { enable }` was AGP 9's experimental *gradual-R8*
+            // toggle, which needs android.r8.gradual.support — not what we want for a production release).
+            // isShrinkResources strips unused res/ (optimized shrinking is automatic in AGP 9). NOTE:
+            // mapping.txt (build/outputs/mapping/<variant>/) is now the deobfuscation map — retain it per
+            // release to symbolicate crashes.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            // Native crash/ANR symbolication for the prebuilt .so we ship (tflite/LiteRT jni,
+            // datastore_shared_counter, SQLCipher, graphics-path). AGP extracts the symbols into the AAB's
+            // BUNDLE-METADATA and Play Console picks them up automatically — no manual upload. This is the
+            // *native* counterpart to the mapping.txt R8 map above (which only covers Kotlin/Java frames).
+            // Extraction runs the NDK's llvm-objcopy, so a matching NDK must be installed — if it's absent
+            // strip/extract SILENTLY no-op (empty symbols, no build error), so the warning would persist.
+            // SYMBOL_TABLE, not FULL, is deliberate: these are third-party libs compiled release with NO
+            // DWARF, so FULL (--only-keep-debug) yields near-empty .dbg (.dynsym NOBITS, 0 symbols) while
+            // SYMBOL_TABLE keeps the real .dynsym (function names) — 444 FUNC syms for tflite vs 0. We have
+            // no first-party native code; revisit FULL only if we ever ship our own -g-compiled .so.
+            // On by default for any `bundle*` task (the Play AAB); off for assembleRelease so the APK stays
+            // NDK-free and byte-identical everywhere — see the nativeSymbols comment up top.
+            if (nativeSymbols) {
+                ndk {
+                    debugSymbolLevel = "SYMBOL_TABLE"
+                }
+            }
+            // Don't stamp the build machine's Git state into the APK. AGP otherwise writes
+            // META-INF/version-control-info.textproto containing the local checkout's HEAD revision (or
+            // `NO_SUPPORTED_VCS_FOUND` when built outside a Git work tree), which makes the packaged bytes
+            // a function of *how the builder obtained the source*. It is the one difference that survived
+            // an otherwise byte-identical rebuild of this commit inside F-Droid's buildserver container —
+            // 1 differing entry out of 185 — and it would fail their rebuild-and-compare verification.
+            // The feature only feeds Play Console's "see the code" crash links; mapping.txt still
+            // symbolicates, and the source is public and tagged, so nothing real is lost.
+            vcsInfo {
+                include = false
+            }
+            // Never build a demo-seeded release, even with `-PseedDemo=true` — demo mode is debug-only and
+            // its classes ship only in src/debug. Overrides the defaultConfig SEED_DEMO/DEMO_DIRECTOR fields.
+            buildConfigField("boolean", "SEED_DEMO", "false")
+            buildConfigField("boolean", "DEMO_DIRECTOR", "false")
+            // The Internet-relay plane is introduced at 2.4.0, so a shipped artifact no longer hides it
+            // (ADR 064) — the release default now agrees with debug, and `-PinternetPlane=false` is what
+            // takes it back out. The user still opts in: the plane ships visible and switched off.
+            //
+            // The LoRa plane is introduced at 2.5.0 (ADR 2026-09.6gtm) and the two flags are a pair again;
+            // `-PloraPlane=false` produces the dark artifact 2.3.0–2.4.x shipped. Same posture as above:
+            // visible and reachable, switched off, and inert until the user pairs a Meshtastic board.
+            buildConfigField("boolean", "INTERNET_PLANE", (internetPlane ?: true).toString())
+            buildConfigField("boolean", "LORA_PLANE", (loraPlane ?: true).toString())
+            // The commons is not introduced yet: a shipped artifact hides it (`-Pcommons=true` lights it
+            // for a maintainer build). Staging inherits this through initWith.
+            buildConfigField("boolean", "COMMONS", (commons ?: false).toString())
+            // The BLE side channel is introduced: on in a shipped artifact.
+            buildConfigField("boolean", "BLE_SIDE_PLANE", (bleSidePlane ?: true).toString())
+            // Finding iPhones through their GATT payload is introduced: on in a shipped artifact.
+            buildConfigField("boolean", "BLE_GATT_PEERS", (bleGattPeers ?: true).toString())
+            // Querying for a blob's holders is introduced: a shipped artifact answers and asks.
+            buildConfigField("boolean", "BLOB_QUERY", (blobQuery ?: true).toString())
+            // The Coded PHY is introduced: on in a shipped artifact.
+            buildConfigField("boolean", "BLE_CODED_PHY", (bleCodedPhy ?: true).toString())
+            // The Bluetooth link boost is introduced: a shipped artifact asks for HIGH while it feeds.
+            buildConfigField("boolean", "BLE_LINK_BOOST", (bleLinkBoost ?: true).toString())
+            // The Bluetooth feed window is introduced: a shipped artifact feeds by its receiver's reports.
+            buildConfigField("boolean", "BLE_FEED_WINDOW", (bleFeedWindow ?: true).toString())
+            // The Wear OS status service is a prototype: dark in a shipped artifact.
+            buildConfigField("boolean", "WEAR_STATUS", (wearStatus ?: false).toString())
+            // Never ship a fault injector, whatever `-PmodelFaultOnLoad` said.
+            buildConfigField("String", "MODEL_FAULT_ON_LOAD", "\"\"")
+            baselineProfile {
+                ignoreFromAllExternalDependencies = true
+            }
+            // Unsigned when no keystore.properties / KNIT_UPLOAD_* creds are present (see signingConfigs).
+            signingConfig = signingConfigs.findByName("release")
+        }
+        debug {
+            // See the debugAbis comment above the android block for why this is debug-only and why
+            // x86_64 is not optional. Empty (`-Pknit.debugAbis=`) leaves the default four-ABI packaging.
+            if (debugAbis.isNotEmpty()) {
+                ndk {
+                    abiFilters += debugAbis
+                }
+            }
+        }
+        create("staging") {
+            // Inherit release's R8 shrink/optimize + resource shrinking + the SEED_DEMO=false override.
+            initWith(getByName("release"))
+            // …but sign with the debug keystore (AGP auto-creates this config; always present, no secrets).
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += "release"
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+    }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+    androidResources {
+        // On-device model files must stay uncompressed so TFLite can mmap them from the APK.
+        noCompress += listOf("tflite")
+    }
+
+    // AGP otherwise embeds a "Dependency metadata" blob (a compressed, signed dependency list, for Play's
+    // use) into the APK signing block at SIGN time — it is absent from the unsigned build, which is why
+    // F-Droid's rebuild + apksigcopier check passes while its `check apk` scan of our *signed* release
+    // rejects the extra signing block. Off for the APK (the F-Droid / off-Play / app-share artifact); the
+    // block is also non-reproducible, so it would fail byte-verification even if the scan allowed it. Left
+    // ON for the Play AAB (includeInBundle) — Play Console reads it for dependency-vulnerability alerts, and
+    // Google never sees the raw AAB signing block the way F-Droid scans the APK.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = true
+    }
+
+    packaging {
+        jniLibs {
+            // On the APK path nativeSymbols is off, so there is no NDK, and AGP's strip step then degrades
+            // SILENTLY (it warns and packages the .so as-is). Opt out of stripping *explicitly* instead, so
+            // the packaged bytes are identical whether or not the build machine happens to have an NDK —
+            // that determinism is what makes F-Droid's rebuild-and-byte-compare verification possible.
+            // Costs ~nothing in APK size: every .so we ship is a third-party release build (LiteRT,
+            // SQLCipher, datastore-shared-counter, graphics-path, CameraX) that upstream already stripped.
+            if (!nativeSymbols) keepDebugSymbols += "**/*.so"
+        }
+    }
+
+    testOptions {
+        val skipMeshLab =
+            providers
+                .gradleProperty("knit.skipMeshLab")
+                .map(String::toBoolean)
+                .orElse(false)
+                .get()
+        val labChaos = providers.gradleProperty("knit.labChaos").orNull
+        val labChaosRuns = providers.gradleProperty("knit.labChaosRuns").orNull
+        val wireVectors = rootProject.layout.projectDirectory.dir("vectors")
+        val writeVectors = providers.environmentVariable("KNIT_WRITE_VECTORS").orElse("")
+        // Run instrumentation tests under Android Test Orchestrator (each test in its own process; combined
+        // with the `clearPackageData` runner arg above). Only affects LOCAL connectedDebugAndroidTest —
+        // FTL injects its own orchestrator via `--use-orchestrator`. animationsDisabled stabilizes UI tests.
+        execution = "ANDROIDX_TEST_ORCHESTRATOR"
+        animationsDisabled = true
+        unitTests {
+            // Robolectric runs the JVM Room/DAO + migration tests (finding #5): it reads AGP's merged
+            // manifest/resources config and supplies a Context + framework SQLite so in-memory Room
+            // executes the real eviction/GC SQL. See app/src/test/java/app/getknit/knit/data/ and
+            // app/src/test/resources/robolectric.properties.
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
+
+            // Robolectric 4.17 needs the JPMS escapes Robolectric documents for JDK 17+ — without them
+            // EVERY Robolectric test dies in setUpApplicationState with "Failed to interact with raw
+            // FileDescriptor internals" (AndroidInterceptors reflects into jdk.internal.access, which
+            // java.base does not open to the unnamed module). 4.16.x needed none of this; SDK 37's
+            // ApplicationSharedMemory is what walks into the interceptor. This is Robolectric's own
+            // published list, kept verbatim so it can be diffed against the docs on the next bump.
+            all { test ->
+                // `-Pknit.skipMeshLab=true` drops the mesh-in-a-box scenarios (app/src/test/.../mesh/lab/)
+                // from the run. They are wall-clock convergence waits (MeshLab.AWAIT_MS) and Kover's
+                // instrumentation slows the suite ~3x, so the coverage job ran them into their timeouts,
+                // failed testDebugUnitTest, and never produced a report; test:mesh-lab already runs them
+                // three times uninstrumented. `--tests` cannot express an exclude, hence the property.
+                if (skipMeshLab) test.filter.excludeTestsMatching("app.getknit.knit.mesh.lab.*")
+                // `-Pknit.labChaos=<seed|random>` (+ `-Pknit.labChaosRuns=<n>`) turns on the mesh lab's seeded
+                // scheduling noise (mesh/lab/LabChaos.kt; scripts/lab-chaos.sh). A system property is a Test
+                // input, so a chaos run is never answered from a plain run's up-to-date or cached result.
+                labChaos?.let { test.systemProperty("knit.labChaos", it) }
+                labChaosRuns?.let { test.systemProperty("knit.labChaosRuns", it) }
+                // The wire vectors (vectors/, ADR 2026-09.fzh7) are read from disk, not the classpath, so Gradle
+                // cannot see them: without this a synced ios-emitted-v1.json leaves the task UP-TO-DATE and the
+                // last green result stands. KNIT_WRITE_VECTORS flips the vector tests into write mode.
+                test.inputs
+                    .dir(wireVectors)
+                    .withPropertyName("wireVectors")
+                    .withPathSensitivity(PathSensitivity.RELATIVE)
+                test.inputs.property("knitWriteVectors", writeVectors)
+                test.jvmArgs(
+                    "--add-opens=java.base/java.lang=ALL-UNNAMED",
+                    "--add-opens=java.base/java.util=ALL-UNNAMED",
+                    "--add-opens=java.base/java.io=ALL-UNNAMED",
+                    "--add-opens=java.base/java.net=ALL-UNNAMED",
+                    "--add-opens=java.base/java.security=ALL-UNNAMED",
+                    "--add-opens=java.base/java.text=ALL-UNNAMED",
+                    "--add-opens=java.base/jdk.internal.access=ALL-UNNAMED",
+                    "--add-opens=java.desktop/java.awt.font=ALL-UNNAMED",
+                    "--add-opens=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+                )
+                // Gradle's Test default is -Xmx512m, and the suite outgrew it: pipeline 860's test:unit GC-thrashed
+                // until pure virtual-time tests tripped runTest's 60 s wall-clock timeout, and the job hit its
+                // hour. Kept modest on purpose: the CI runners include a workstation that is also in daily use,
+                // and this fork's RSS is the heap plus ~0.75 GB of uncapped Metaspace (Robolectric's android-all).
+                test.maxHeapSize = "1g"
+            }
+        }
+
+        // Gradle Managed Device: a headless emulator Gradle provisions/boots/tears down itself, so
+        // `./gradlew :app:pixel7api33DebugAndroidTest -PseedDemo=true` runs the seeded suite on an
+        // emulator ONLY — it never touches whatever physical lab devices are attached to adb (which
+        // plain `connectedDebugAndroidTest` would). Pixel 7 @ API 33 mirrors the FTL matrix's middle
+        // device (cheetah@33 is a Pixel 7). `aosp-atd` = the Automated Test Device image: headless,
+        // GMS-stripped, fastest for UI tests — and the app uses no GMS, so nothing is lost.
+        managedDevices {
+            localDevices {
+                create("pixel7api33") {
+                    device = "Pixel 7"
+                    apiLevel = 33
+                    systemImageSource = "aosp-atd"
+                }
+                // Headless emulator for the accessibility suite (app.getknit.knit.a11y): the Compose ATF
+                // checks are @RequiresApi(34), so they need an API-34+ device — pixel7api33 is too old and
+                // just skips them (@SdkSuppress). Run: `./gradlew :app:pixel8api34DebugAndroidTest
+                // -PseedDemo=true -Pandroid.testInstrumentationRunnerArguments.package=app.getknit.knit.a11y`.
+                // aosp-atd (headless, GMS-stripped) is fine — ATF is a pure library; fall back to "aosp" if
+                // the ATD image isn't published for 34.
+                create("pixel8api34") {
+                    device = "Pixel 8"
+                    apiLevel = 34
+                    systemImageSource = "aosp-atd"
+                }
+            }
+        }
+    }
+
+    sourceSets {
+        // Serve the exported Room schemas (app/schemas/) as DEBUG-variant assets so MigrationTestHelper can
+        // load them under Robolectric — it reads the schema from context.assets/<db-class>/<version>.json, and
+        // Robolectric serves the merged *debug* assets (unit tests run against the debug variant), but not the
+        // `test` source set's own assets. Scoped to debug, so the ~15 KB schema JSON never ships in release.
+        // See KnitDatabaseMigrationTest.
+        getByName("debug") {
+            assets.directories.add("schemas")
+        }
+        // The `staging` build type is release-with-R8 signed by the debug key (device testing only). It has
+        // no src/staging, so reuse the release variant's no-op DemoWiring stub for the two src/main demo
+        // seams (seedDemoIfEnabled / demoTransportOrNull) — staging must not demo-seed, exactly like release.
+        getByName("staging") {
+            kotlin.directories.add("src/release/java")
+        }
+    }
+}
+
+// The checkout's short commit for About's Build section — DEBUG ONLY (ADR 2026-09.6eb6's amendment). A
+// release or staging APK keeps defaultConfig's empty GIT_SHA: F-Droid rebuilds the
+// release from a tree with no `.git` and byte-compares it against ours, which is the same reason
+// `vcsInfo { include = false }` is set; a release's version already names its tag. Read through a
+// ValueSource that the debug variant's field holds lazily, so `git` runs only when a debug BuildConfig is
+// generated (never at configuration time, so the configuration cache is not keyed on HEAD), and a checkout
+// with no Git — or no `git` on the PATH — yields an empty string rather than a failed build.
+abstract class GitShortSha : ValueSource<String, GitShortSha.Params> {
+    interface Params : ValueSourceParameters {
+        val repoDir: DirectoryProperty
+    }
+
+    @get:Inject
+    abstract val execOperations: ExecOperations
+
+    override fun obtain(): String =
+        runCatching {
+            val repo =
+                parameters.repoDir.asFile
+                    .get()
+                    .absolutePath
+            val out = ByteArrayOutputStream()
+            val result =
+                execOperations.exec {
+                    commandLine("git", "-C", repo, "rev-parse", "--short", "HEAD")
+                    standardOutput = out
+                    errorOutput = ByteArrayOutputStream()
+                    isIgnoreExitValue = true
+                }
+            if (result.exitValue == 0) out.toString(Charsets.UTF_8).trim() else ""
+        }.getOrDefault("")
+}
+
+val gitShortSha =
+    providers.of(GitShortSha::class.java) {
+        parameters.repoDir.set(rootProject.layout.projectDirectory)
+    }
+
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        variant.buildConfigFields?.put(
+            "GIT_SHA",
+            gitShortSha.map { BuildConfigField("String", "\"$it\"", "Short commit of the checkout; debug only") },
+        )
+    }
+}
+
+// Guards against building an APK whose moderation models are Git LFS pointer stubs (or otherwise
+// truncated). This used to be a live hazard: `*.tflite` was tracked in Git LFS, and any checkout without a
+// working LFS client — notably F-Droid's buildserver, which has no LFS support — silently substitutes a
+// ~130-byte pointer file. Both moderators catch an unreadable model and degrade to allow-all *by design*
+// (see NsfwImageModerator/MlTextModerator), so nothing downstream would ever complain; the app would just
+// ship with moderation quietly disabled. The models are plain Git blobs now (see .gitattributes), which
+// makes that impossible from a normal clone — this keeps it impossible from an abnormal one.
+val checkModerationModels =
+    tasks.register("checkModerationModels") {
+        description = "Fails the build if a bundled .tflite moderation model is missing or a stub."
+        // Resolved to plain Files and a Provider HERE, at configuration time, and captured by value below:
+        // a doLast lambda that reached out to a script-level property instead would pull the build-script
+        // object into the configuration cache, which cannot serialize it (org.gradle.configuration-cache
+        // is on — see gradle.properties).
+        val models =
+            listOf("nsfw.tflite", "toxicity.tflite").map {
+                layout.projectDirectory.file("src/main/assets/moderation/$it").asFile
+            }
+        val stamp = layout.buildDirectory.file("tmp/checkModerationModels.stamp")
+        inputs.files(models).withPropertyName("moderationModels")
+        outputs.file(stamp)
+        doLast {
+            models.forEach { model ->
+                if (!model.isFile) {
+                    throw GradleException("Moderation model missing: $model")
+                }
+                val head = model.inputStream().use { String(it.readNBytes(48), Charsets.US_ASCII) }
+                if (head.startsWith("version https://git-lfs")) {
+                    throw GradleException(
+                        "Moderation model $model is a Git LFS pointer, not the real model. " +
+                            "This repo no longer uses LFS for *.tflite — re-checkout the file " +
+                            "(git checkout -- ${model.name}) or fetch it from a full clone.",
+                    )
+                }
+                if (model.length() < 1_000_000L) {
+                    throw GradleException(
+                        "Moderation model $model is only ${model.length()} bytes — expected >= 1 MB. " +
+                            "A truncated model would silently disable content moderation.",
+                    )
+                }
+            }
+            stamp
+                .get()
+                .asFile
+                .apply { parentFile.mkdirs() }
+                .writeText("ok")
+        }
+    }
+
+tasks.named("preBuild") { dependsOn(checkModerationModels) }
+
+// Compose preview screenshot tests render in a forked JVM, and some previews format an absolute time with that
+// JVM's zone and locale (the pause deadline, message-details stamps, profile and Your mesh dates): rendered
+// under another TZ, twelve images moved. Pin both so a reference matches on every machine. Both screenshot
+// tasks are `Test`s.
+//
+// Their reference PNGs are the repo's one Git LFS rule (see .gitattributes). A clone without git-lfs holds
+// ~130-byte pointer files there, and every comparison would fail as an unreadable image — or an `update` would
+// write real PNGs that commit as plain blobs. So both tasks refuse up front and say what is missing. The tree is
+// resolved here, at configuration time, and captured by value (configuration cache; see checkModerationModels).
+val screenshotReferences =
+    fileTree(layout.projectDirectory.dir("src")) { include("screenshotTest*/reference/**/*.png") }
+tasks.withType<Test>().configureEach {
+    if (name.endsWith("ScreenshotTest")) {
+        systemProperty("user.timezone", "UTC")
+        systemProperty("user.language", "en")
+        systemProperty("user.country", "US")
+        val references = screenshotReferences
+        doFirst {
+            val pointer =
+                references.firstOrNull { png ->
+                    png.inputStream().use { String(it.readNBytes(32), Charsets.US_ASCII) }.startsWith("version https://git-lfs")
+                }
+            if (pointer != null) {
+                throw GradleException(
+                    "Screenshot reference $pointer is a Git LFS pointer, not an image. The references are " +
+                        "stored in Git LFS: install git-lfs, then run `git lfs install && git lfs pull`.",
+                )
+            }
+        }
+    }
+}
+
+// Mesh-lab chaos shards (scripts/lab-chaos.sh, LabChaos.kt). Gradle's forks split a run by class, never by seed, so a
+// sweep of one class on n seeds ran in one JVM, one seed after another, on a 24-core box — and under chaos that JVM is
+// mostly asleep in the stalls it injects. `-Pknit.labChaosShards=<k>` registers k copies of testDebugUnitTest, each
+// running every selected scenario on its own slice of the seeds `knit.labChaos .. + knit.labChaosRuns - 1`, filtered by
+// `knit.labChaosTests` (comma-separated `--tests` patterns: a task option binds to one task, a property to all k). With
+// the configuration cache on they run in parallel, each writing build/test-results/labChaosShard<i>/. Never up to date:
+// a sweep is a draw, not a build product. Off unless asked for, so nothing else sees these tasks.
+val labChaosShards =
+    providers
+        .gradleProperty("knit.labChaosShards")
+        .map(String::toInt)
+        .orElse(0)
+        .get()
+if (labChaosShards > 0) {
+    val firstSeed = providers.gradleProperty("knit.labChaos").get().toLong()
+    val totalRuns =
+        providers
+            .gradleProperty("knit.labChaosRuns")
+            .map(String::toInt)
+            .orElse(1)
+            .get()
+    val patterns =
+        providers
+            .gradleProperty("knit.labChaosTests")
+            .orElse("app.getknit.knit.mesh.lab.*")
+            .get()
+            .split(',')
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+    var nextSeed = firstSeed
+    for (i in 0 until minOf(labChaosShards, totalRuns)) {
+        val runs = totalRuns / labChaosShards + if (i < totalRuns % labChaosShards) 1 else 0
+        val seed = nextSeed
+        nextSeed += runs
+        tasks.register<Test>("labChaosShard$i") {
+            description = "Mesh-lab scenarios under chaos on seeds $seed..${seed + runs - 1} (scripts/lab-chaos.sh)."
+            group = "verification"
+            // AGP registers the unit-test task once the variants exist; this action runs later, when the shard is
+            // realized, and copies what `testOptions.unitTests.all` gave it (classpath, JPMS flags, heap).
+            val base = tasks.named<Test>("testDebugUnitTest").get()
+            testClassesDirs = base.testClassesDirs
+            classpath = base.classpath
+            javaLauncher.set(base.javaLauncher)
+            jvmArgs(base.jvmArgs)
+            maxHeapSize = base.maxHeapSize
+            systemProperties(base.systemProperties)
+            systemProperty("knit.labChaos", seed.toString())
+            systemProperty("knit.labChaosRuns", runs.toString())
+            useJUnit()
+            filter { patterns.forEach(::includeTestsMatching) }
+            outputs.upToDateWhen { false }
+        }
+    }
+}
+
+// `room3`, not `room`: the Room 3 Gradle plugin (id "androidx.room3") registers its extension under that
+// name. Same DSL, same output layout.
+room3 {
+    // Export the Room schema JSON via the Room Gradle plugin (replaces the raw ksp `room.schemaLocation`
+    // arg — the plugin rejects that arg if also set). With only build types (no product flavors) it writes
+    // the flat schemas/app.getknit.knit.data.KnitDatabase/<version>.json — same layout the ksp arg produced —
+    // which the debug sourceSet below serves as a unit-test asset so MigrationTestHelper can read it.
+    // Requires exportSchema = true on KnitDatabase; regenerate the checked-in schema by clearing app/schemas/
+    // and rebuilding after any @Database version bump (KSP incremental caching can otherwise skip re-export).
+    schemaDirectory("$projectDir/schemas")
+}
+
+kotlin {
+    compilerOptions {
+        // Kotlin warnings are build errors. They are otherwise invisible in day-to-day work: kotlinc only
+        // prints a diagnostic for the files it actually compiles, so an UP-TO-DATE / FROM-CACHE / incremental
+        // `assembleDebug` reports nothing, and the whole module's warning set only reappears on a cold compile
+        // of a variant nobody builds often (which is how eight of them reached 2.5.0 unseen). Nothing else
+        // catches these: Android Lint runs its own UAST issue registry, and detekt runs without type
+        // resolution, so neither sees an unused expression, an always-true condition, or a missing opt-in.
+        //
+        // Applies to every compilation in the module — main, unit-test and androidTest — deliberately: a
+        // flag that covered only main sources would let the test sources rot instead.
+        //
+        // `-Pknit.warningsAsErrors=false` turns it back into warnings. That is the escape hatch for a
+        // toolchain bump on this deliberately bleeding-edge stack (a new Kotlin, AGP or androidx release can
+        // deprecate an API we call and turn a green build red): flip it off, triage, fix, flip it back — do
+        // not delete this block. It changes no bytecode, so the release APK stays byte-identical either way.
+        allWarningsAsErrors.set(
+            providers.gradleProperty("knit.warningsAsErrors").map(String::toBoolean).orElse(true),
+        )
+    }
+}
+
+kover {
+    // Coverage is measured from the DEBUG unit tests (`:app:testDebugUnitTest` — the JVM mesh/protocol/data +
+    // Robolectric Room/Compose suites), so the per-variant report tasks to run are the *Debug ones:
+    //   ./gradlew :app:koverHtmlReportDebug   → app/build/reports/kover/htmlDebug/index.html
+    //   ./gradlew :app:koverXmlReportDebug    → app/build/reports/kover/reportDebug.xml (CI-parseable)
+    reports {
+        filters {
+            excludes {
+                // Generated code, and the code no release build ships — everything else hand-written
+                // (including di/ wiring and the Robolectric-tested *ScreenContent composables) stays measured
+                // so the number is honest about what users run.
+                // NOTE: in Kover class globs, `*` does NOT cross the package separator `.` — use `**` to
+                // span packages (verified on-report; a bare `*_Impl` matches nothing here). `$$serializer`,
+                // `R`, and `Manifest` never appear in the report, so they need no rule.
+                classes(
+                    "**_Impl", // Room-generated DAO/database implementations (KSP)
+                    "**_Impl$*", // ...and their nested classes ($1, $Companion, open-delegates)
+                    "**ComposableSingletons*", // Compose-generated lambda-holder classes
+                    "**BuildConfig", // generated BuildConfig
+                    // The debug source set (src/debug/java) outside the two packages below — the release
+                    // twin of DemoWiring is a no-op stub, and the report is the debug variant's.
+                    "app.getknit.knit.di.DemoWiring*",
+                    "app.getknit.knit.mesh.DemoTransport*",
+                    "app.getknit.knit.mesh.DemoLoraPlane*",
+                    "app.getknit.knit.mesh.DemoBoardDirectory*", // declared in DemoLoraPlane.kt
+                )
+                // The debug bridge and the demo seeder/director (src/debug/java), plus main's DemoComposer —
+                // inert unless the debug director emits, and stripped by R8 from release.
+                packages("app.getknit.knit.debug", "app.getknit.knit.demo")
+            }
+        }
+    }
+}
+
+detekt {
+    // Overlay config/detekt/detekt.yml on detekt's bundled defaults (== the old CLI's
+    // --build-upon-default-config). Analyze the same inputs the CLI did — main + unit-test Kotlin — set
+    // explicitly rather than via source-set autodiscovery: AGP 9's built-in Kotlin (no kotlin-android
+    // plugin) can leave detekt's discovery empty. No compile classpath is wired, so this runs WITHOUT type
+    // resolution, exactly like the old `detekt-cli` invocation. Reports land in build/reports/detekt/.
+    buildUponDefaultConfig = true
+    config.setFrom(files("$rootDir/config/detekt/detekt.yml"))
+    source.setFrom(files("src/main/java", "src/test/java"))
+}
+
+ktlint {
+    // Pin the ktlint *tool* version (libs.versions.ktlint) so rule behavior stays fixed independent of the
+    // plugin version. Rules come from the repo-root .editorconfig (auto-discovered), incl. the @Composable
+    // function-naming opt-out. `ktlintFormat` autocorrects; `ktlintCheck` verifies. Reports → build/reports/ktlint/.
+    version.set(libs.versions.ktlint.get())
+    reporters {
+        reporter(ReporterType.PLAIN)
+        reporter(ReporterType.HTML)
+        reporter(ReporterType.SARIF)
+    }
+}
+
+dependencyLocking {
+    // Lock resolved versions to app/gradle.lockfile so Trivy (and reproducible builds) have a concrete
+    // dependency manifest to scan — there is no other lockfile/SBOM. Native Gradle, no plugin. Regenerate
+    // with `./gradlew :app:dependencies --write-locks` after bumping versions in libs.versions.toml.
+    lockAllConfigurations()
+}
+
+dependencies {
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.navigation.compose)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.material.icons.extended)
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.exifinterface)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.lifecycle.service)
+    // ProcessLifecycleOwner, for AppVisibility (#170). Already shipped transitively and initialised by androidx.startup.
+    implementation(libs.androidx.lifecycle.process)
+
+    // Coroutines
+    implementation(libs.kotlinx.coroutines.android)
+
+    // Serialization (wire protocol: CBOR for compact mesh frames; JSON for the file-header sidecar)
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.kotlinx.serialization.cbor)
+
+    // Persistence
+    implementation(libs.androidx.room.runtime)
+    ksp(libs.androidx.room.compiler)
+    implementation(libs.androidx.datastore.preferences)
+    implementation(libs.sqlcipher.android) // at-rest encryption for the Room DB (SQLCipher)
+
+    // Dependency injection (Koin — pure-Kotlin, no Gradle plugin / no AGP coupling)
+    implementation(libs.koin.android)
+    implementation(libs.koin.androidx.compose)
+
+    // Mesh transport is Wi-Fi Aware (android.net.wifi.aware.*, framework API) — no external dependency.
+
+    // Images
+    implementation(libs.coil.compose)
+    implementation(libs.coil.gif) // animated GIF/WebP decoding (keyboard GIFs)
+
+    // On-device ML runtimes (no network; models bundled in assets). See the version catalog for why
+    // the bare classic interpreter (LiteRT 1.4.x) is used rather than MediaPipe or the heavier LiteRT 2.x.
+    // The text toxicity tokenizer is pure Kotlin (SentencePieceTokenizer, parses tokenizer.json via
+    // kotlinx-serialization) — no native tokenizer lib, so nothing to 16 KB-align and no .so added to the APK.
+    implementation(libs.litert)
+
+    // E2E encryption (Tink — Java + native, no Kotlin metadata / no Gradle plugin, like SQLCipher)
+    implementation(libs.tink.android)
+    // QR identity verification (safety-number / QR verify screen). zxing core is the pure-Java codec for
+    // both directions — it renders our identity QR (ui/image/QrCode.kt) and decodes camera frames
+    // (ui/scan/QrDecoder.kt). CameraX drives the camera; we own the analyze loop so a malformed frame can
+    // never throw off the main thread. See ADR 015 and the cameraX pin in the version catalog for why
+    // zxing-android-embedded was dropped.
+    implementation(libs.zxing.core)
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+
+    // Offline "Share Knit app": when installed from Play as an App Bundle, merge the on-device split
+    // APKs into one universal APK (ARSCLib) and re-sign it (apksig). Both pure Java, no Kotlin metadata —
+    // see gradle/libs.versions.toml. Used only by ui/invite/ApkMerger.kt.
+    implementation(libs.reandroid.arsclib)
+    implementation(libs.apksig)
+
+    // The spool (Internet-relay) plane's WebSocket client and the link-preview fetch — see
+    // docs/SPOOL_PROTOCOL.md, ADR 2026-09.n752 and the version catalog. The mesh itself never touches it:
+    // only mesh/spool/OkHttpSpoolDialer.kt and linkpreview/OkHttpPreviewFetcher.kt may import okhttp3, and
+    // both features are off unless the user turns them on.
+    implementation(libs.okhttp)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.koin.test.junit4)
+    testImplementation(libs.mockk) // relaxed mocks of the concrete Room-backed repos in InboundPipelineTest
+    testImplementation(libs.okhttp.mockwebserver) // a socket for OkHttpPreviewFetcherTest's caps and redirect policy
+    // JVM Room/DAO + migration tests (finding #5): Robolectric supplies a Context + framework SQLite so
+    // in-memory Room runs the real eviction/GC SQL, and room-testing's MigrationTestHelper rebuilds the
+    // exported schema on that same shadowed SQLite (via androidx.sqlite's AndroidSQLiteDriver, already pulled
+    // by Room). See app/src/test/java/app/getknit/knit/data/.
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.junit) // AndroidJUnit4 runner on the JVM (delegated by Robolectric)
+    testImplementation(libs.androidx.test.core) // ApplicationProvider.getApplicationContext()
+    testImplementation(libs.androidx.room.testing) // MigrationTestHelper (was androidTest-only)
+    // Compose UI tests run on Robolectric (createComposeRule in :app:testDebugUnitTest, no emulator) against
+    // the stateless *ScreenContent composables. The BOM (implementation platform) and compose-ui-test-manifest
+    // (debugImplementation, below) are already on the unit-test classpath; only the junit4 rule needs adding.
+    testImplementation(libs.androidx.compose.ui.test.junit4)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    // Accessibility Test Framework (ATF) checks in the Compose suite — the same framework the Play
+    // pre-launch report runs. Pulls ATF + AccessibilityValidator transitively; drives the API-34+
+    // a11y package (app.getknit.knit.a11y, @RequiresApi(34)). See .agents/context/testing.md.
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4.accessibility)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.room.testing)
+    // Firebase Test Lab seeded UI suite (app/src/androidTest/…/ui): explicit runner + rules
+    // (ActivityScenario/GrantPermissionRule; runner was only transitive) and the Orchestrator + its
+    // test-services APK (androidTestUtil, for local connectedDebugAndroidTest parity). See AGENTS.md /
+    // .agents/context/testing.md.
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.rules)
+    androidTestImplementation(libs.androidx.test.services.storage) // TestStorage: FTL-collected screenshots
+    // UIAutomator black-box suite (app.getknit.knit.uiauto): drives the real app process via resource-ids
+    // (testTagsAsResourceId) + the system UI (notification shade, Recents). See .agents/context/testing.md.
+    androidTestImplementation(libs.androidx.test.uiautomator)
+    androidTestUtil(libs.androidx.test.orchestrator)
+    androidTestUtil(libs.androidx.test.services)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
+    debugImplementation(libs.androidx.compose.ui.tooling)
+    // Compose Preview Screenshot Testing: `@PreviewTest` plus the preview renderer's tooling, for the
+    // `screenshotTest` source set only. See .agents/context/testing.md.
+    screenshotTestImplementation(libs.compose.screenshot.validation.api)
+    screenshotTestImplementation(libs.androidx.compose.ui.tooling)
+}

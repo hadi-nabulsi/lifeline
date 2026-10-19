@@ -1,0 +1,2305 @@
+package app.getknit.knit.mesh.lora
+
+import app.getknit.knit.BuildConfig
+import app.getknit.knit.mesh.FanoutHint
+import app.getknit.knit.mesh.FastPathDrop
+import app.getknit.knit.mesh.InboundFrame
+import app.getknit.knit.mesh.MeshMetrics
+import app.getknit.knit.mesh.MeshPost
+import app.getknit.knit.mesh.MeshTransport
+import app.getknit.knit.mesh.Peer
+import app.getknit.knit.mesh.PublicChannelSink
+import app.getknit.knit.mesh.PublicPostRefusal
+import app.getknit.knit.mesh.ReceivedFile
+import app.getknit.knit.mesh.SeenSet
+import app.getknit.knit.mesh.StoreDigest
+import app.getknit.knit.mesh.TransportHealth
+import app.getknit.knit.mesh.TransportKind
+import app.getknit.knit.mesh.isPresenceEvidence
+import app.getknit.knit.mesh.link.FastFrameCodec
+import app.getknit.knit.mesh.link.FragReassembler
+import app.getknit.knit.mesh.meshNodeLabel
+import app.getknit.knit.mesh.protocol.FrameType
+import app.getknit.knit.mesh.protocol.ReceiptContent
+import app.getknit.knit.mesh.protocol.RelayEnvelope
+import app.getknit.knit.mesh.protocol.WireCodec
+import app.getknit.knit.mesh.protocol.WireEnvelope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * A [MeshTransport] that carries the mesh's small floodable frames over LoRa via a Meshtastic board
+ * ([MeshtasticLink]), extending the reach of the **Nearby room** beyond BLE/NAN range. It is a
+ * fast-plane-ONLY child of [app.getknit.knit.mesh.CompositeMeshTransport] (added last, lowest preference):
+ *
+ * - [neighbors] is always empty, so the reliable flood, custody digest sync, key requests, blob pulls and
+ *   the `watchNeighbors` hooks never touch a ~1 kbps link — [send]/[sendFile]/[sendDigest] are no-ops.
+ * - [fastFanout]/[longRangeFanout]/[fastSend] are the only outbound paths: they decode the envelope (never
+ *   re-encoding it — `sig`/`signed` pass through [FastFrameCodec] byte-exact), apply [LoraFramePolicy], skip
+ *   a DM-form frame a live link already carries ([coveredByLink], ADR 054), compact/fragment via
+ *   [LoraFrameCodec], and pace the result ([LoraPacePolicy]) onto the board. The long-range path is what
+ *   carries sealed DM-form chat (ADR 039); this plane is the only one it exists for.
+ * - inbound packets are decoded/reassembled and injected into [inbound] exactly like the Wi-Fi Aware fast
+ *   plane's `emitFastWire`, so the router's dedup/verify/custody/relay all run unchanged.
+ * - [shortRange] is false: a LoRa sighting doesn't imply proximity, so siblings ignore its `reachable` set
+ *   and nothing above the composite may read it as *nearby* (`MeshController.neighbors` is the short-range
+ *   set for exactly this reason). [reachable] here is keyed on the frame **author**, and a gateway puts
+ *   other people's frames on air, so a peer with no board of its own can be reachable over this plane.
+ *   Only a frame that passes [app.getknit.knit.mesh.isPresenceEvidence] counts — a custody re-serve says
+ *   where a frame has been, not where its author is. The Internet plane keys presence off the same rule.
+ *
+ * On first hearing a peer the transport also re-offers the carried DM-form frames addressed to it
+ * ([reofferTo]) — the plane's only backfill, since custody's digest sync needs a data path. Since ADR
+ * 2026-10.a4pm that is also how most DMs to a quiet peer reach the air: a DM-form fan-out rides only to a
+ * recipient in [reachable], except one plain DM per recipient per [DM_PROBE_WINDOW_MS] ([dmProbeAt]), whose
+ * ✓✓ is what makes a present recipient heard.
+ *
+ * Key bootstrap over LoRa (the far side has never seen the author's profile) rides two paths: the mesh's
+ * existing `watchReachable` reflood, plus a self-profile beacon this transport sends on session-up (under a
+ * 5-min floor) and on first hearing a peer (under a 60-s gap, so a two-sided bootstrap completes without a
+ * periodic beacon — [beaconProfile]). A **relayed** profile is fanned once per publish ([profileSeen],
+ * ADR 057) rather than on every flood-dedup lapse, and repaired — when a far pocket really lacks one — by
+ * the bridge's digest-driven backfill rather than by re-offering it to everyone.
+ *
+ * Its rate limiters outlive the process ([LoraPlaneState]): the airtime ledger, the beacon floor, the gossip
+ * interval, the serve cap and the profile re-fan gate are all read back at [start] and written behind a
+ * debounce, because a limiter that resets on launch is not a limiter — a restart used to hand this plane a
+ * fresh 45-second allowance and re-run every "first time" behaviour against it.
+ *
+ * [clock] is monotonic (pacing, dedup, linger); [wallClock] is the epoch clock a frame's `sentAt` is stamped
+ * in, read by the freshness gate and by the persisted limiters (a monotonic stamp cannot survive a reboot).
+ * Pure/Android-free — the
+ * only `android.bluetooth.*` sits behind the [MeshtasticLink]/[MeshtasticGattDialer] seam.
+ *
+ * Large by suppression, as [MeshtasticSession] is: this is the plane's single owner. The pacer loop, the
+ * gossip loop, the linger sweep, the gateway election and the published status all read and write one set
+ * of mutable fields under one scope, so splitting it would mean a second owner of that state.
+ */
+@Suppress("TooManyFunctions", "LongParameterList", "LargeClass")
+internal class LoraMeshTransport(
+    private val selfId: suspend () -> String,
+    private val link: MeshtasticLink,
+    private val config: Flow<LoraConfig?>,
+    private val selfProfile: suspend () -> WireEnvelope?,
+    private val farFrames: suspend (nodeId: String) -> List<WireEnvelope> = { emptyList() },
+    private val offerPrefixes: suspend (limit: Int) -> IntArray = { IntArray(0) },
+    private val framesMissing: suspend (prefixes: IntArray, limit: Int, dms: Boolean) -> List<WireEnvelope> =
+        { _, _, _ -> emptyList() },
+    /** Delivers a post heard on the board's primary channel into the Meshtastic room — [app.getknit.knit.mesh.MeshPostSink]. */
+    private val onPublicPost: suspend (MeshPost) -> Unit = {},
+    /**
+     * The bound board's node number and signing key, reported each time its session comes up. What the
+     * profile advertises so a contact's phone can line a heard post up with this one and verify it
+     * (`SettingsStore.loraBoard`); persisted by the caller, so a link drop does not unsay it and only a
+     * different board changes it.
+     */
+    private val onBoardBound: suspend (BoardBinding) -> Unit = {},
+    private val scope: CoroutineScope,
+    private val metrics: MeshMetrics,
+    /**
+     * Where this plane's rate limiters go when the process dies, so a restart does not begin with a fresh
+     * airtime allowance and re-run every "first time" behaviour against it ([LoraPlaneState]).
+     */
+    private val state: LoraPlaneState = LoraPlaneState.None,
+    private val clock: () -> Long,
+    private val wallClock: () -> Long = System::currentTimeMillis,
+    private val log: (String) -> Unit = {},
+    // The dedicated-slot duty unlock is debug-only, like the setup that pins the slot (ADR 067); a release
+    // build budgets exactly as it always has, even against a board somebody pinned by hand.
+    private val pace: LoraPacePolicy = LoraPacePolicy(airtime = LoraAirtime(dedicatedUnlocksDuty = BuildConfig.DEBUG)),
+    private val gateway: LoraGatewayPolicy = LoraGatewayPolicy(),
+    private val gossip: LoraGossipPolicy = LoraGossipPolicy(),
+    /**
+     * How often [lingerSweepLoop] re-reads the heard set. The field value always; the mesh-in-a-box lab shortens it,
+     * because a scenario that moves the calendar past the linger needs the sweep to notice inside an await.
+     */
+    private val lingerSweepMs: Long = LINGER_SWEEP_MS,
+) : MeshTransport,
+    LoraPlaneStatus,
+    PublicChannelSink {
+    override val kind = TransportKind.LoRa
+    override val hasFastPlane = true
+    override val shortRange = false
+
+    private val _neighbors = MutableStateFlow<Set<Peer>>(emptySet())
+    override val neighbors = _neighbors.asStateFlow() // always empty: no data-path links over LoRa
+
+    private val _reachable = MutableStateFlow<Set<Peer>>(emptySet())
+    override val reachable = _reachable.asStateFlow()
+
+    private val _health = MutableStateFlow(TransportHealth.Unavailable)
+    override val health = _health.asStateFlow()
+
+    private val _inbound = MutableSharedFlow<InboundFrame>(extraBufferCapacity = INBOUND_BUFFER)
+    override val inbound = _inbound.asSharedFlow()
+
+    override val incomingFiles: Flow<ReceivedFile> = emptyFlow() // LoRa carries no files
+
+    private val _status = MutableStateFlow(LoraStatus())
+
+    /** A snapshot for the LoRa settings row + the `…debug.LORA` bridge; derived, never routing-affecting. */
+    override val status = _status.asStateFlow()
+
+    // Coordination-plane dedup keyed on the first 8 bytes of the Ed25519 sig: records every frame we send
+    // OR receive over LoRa, so (a) a frame heard over LoRa is not re-fanned back over it (the composite
+    // re-calls fastFanout on relay), and (b) AckSync's verbatim 24 h tick retries are dropped inside the
+    // receiver's own SeenSet window.
+    private val sigSeen = SeenSet(ttlMillis = SIG_TTL_MS, clock = clock)
+
+    /**
+     * Profile publishes this plane has already put on the air, keyed on the frame id — which
+     * `MeshManager.currentProfileEnvelope` derives from the publish stamp, so it is stable for a publish and
+     * new for the next one. Separate from [sigSeen] because the two answer different questions on very
+     * different clocks: [sigSeen] asks "is this frame in flight right now" (10 min, the flood-suppression
+     * window), this one asks "does the LoRa horizon already have this profile" — and the answer holds until
+     * the author republishes. See [PROFILE_REFAN_MS] and ADR 057.
+     */
+    private val profileSeen = SeenSet(ttlMillis = PROFILE_REFAN_MS, clock = clock)
+
+    /**
+     * Who has been told the board is unmonitored, and when the board last said so — the DM auto-reply's two
+     * caps. Not cleared by [quiesce]: the memory is about the senders, not the board, and losing the link
+     * for a minute must not earn anybody a second reply.
+     */
+    private val autoReply = DmAutoReplyPolicy(clock = clock)
+
+    /**
+     * When a DM last went out as a probe to each recipient this plane had not heard (ADR 2026-10.a4pm): the
+     * reach gate's one exception per [DM_PROBE_WINDOW_MS]. Persisted with the other limiters and, like
+     * [autoReply], not cleared by [quiesce] — see [LoraDmProbe].
+     */
+    private val dmProbeAt = LoraDmProbe()
+
+    /**
+     * The DM-form frames the first-hearing re-offer put on the air within the last [REOFFER_MEMORY_MS], by frame
+     * id (ADR 2026-10.a4pm): one frame is re-aired at most once an hour across first hearings, so a recipient
+     * heard only now and then does not have the same backlog re-aired every linger cycle. A limiter, so it is
+     * persisted with the others and not cleared by [quiesce].
+     */
+    private val reofferedAt = SeenSet(ttlMillis = REOFFER_MEMORY_MS, clock = clock)
+    private val fragSeq = AtomicInteger()
+    private val reassembler = FragReassembler<UInt>(now = clock, capacity = FRAG_CAP, timeoutMs = FRAG_TIMEOUT_MS)
+
+    // LoRa-heard senders (a long linger — there are no periodic cues on LoRa), and the profile-beacon floor.
+    // NOTE these are frame **authors**, not radios: a frame is authored by one node and may be put on air by
+    // another's board, relayed or backfilled out of its custody. That is the right key for `reachable` (who
+    // can I reach through this mesh) and the wrong one for "how many radios can I hear" — see boardsHeardAt.
+    // Only frames that pass `mesh/FramePresence.kt`'s isPresenceEvidence write here: a re-serve proves where a
+    // frame has been, not where its author is, and taking it as presence made powered-off phones look live.
+    // Also the reason nothing above this plane may read `reachable` as *nearby* — that is the short-range set.
+    private val lastHeardAt = ConcurrentHashMap<String, Long>()
+
+    // Meshtastic node numbers we have heard transmit on our channel: one entry per **radio**, which is what
+    // the settings row is actually asking. Counted for every Knit packet including control packets and
+    // incomplete fragments — a board that only publishes offers is still a board in range. The value is that
+    // radio's last signal reading, so the row reports a link we actually have rather than the last thing the
+    // board overheard, and one linger rule ages the reading out with the radio it belongs to.
+    private val boardsHeardAt = ConcurrentHashMap<UInt, RxQuality>()
+    private val heardPeers = ConcurrentHashMap<String, Peer>()
+
+    // Author -> the radio that aired the fresh frame which last put them in `reachable`, so a hearing can be
+    // withdrawn once that radio turns out to belong to our own pocket (ADR 2026-09.6gk8).
+    private val heardVia = ConcurrentHashMap<String, UInt>()
+
+    // Radio -> the publisher key of the OFFERs it airs, i.e. the Knit node that owns it. An OFFER is only ever
+    // put on the air by its publisher's own board (a Meshtastic repeat keeps `from`), so this is the one
+    // unforgeable-enough board -> node binding the plane has without trusting a profile's self-asserted
+    // `loraNode`. Aged on the same linger as the radios themselves.
+    private val boardOwners = ConcurrentHashMap<UInt, OfferedBy>()
+    private val lastSelfProfileAt = AtomicLong(NEVER)
+
+    // Peers a short-range sibling has *sighted*. Diagnostics only — deliberately nothing routes on it.
+    // Every routing decision here reads `linkedPeers` instead; the two differ exactly when a peer is heard
+    // but not linked, which is the state that silenced a board in the field, so it is worth being able to see.
+    @Volatile
+    private var foreignReachable: Set<String> = emptySet()
+
+    // Peers a higher-preference plane holds a **live link** to right now (BLE/NAN, via suppressDataPath).
+    // The gateway election reads this and NOT `foreignReachable`: a sighting is not a data path, and the
+    // whole premise of standing down is that the other board will carry our traffic for us.
+    @Volatile
+    private var linkedPeers: Set<String> = emptySet()
+
+    /** [linkedPeers], for the `mesh/lab` harness to wait on the composite's hand-off (`LabNode.awaitBoardSawLinks`). */
+    internal val pocketLinkIds: Set<String> get() = linkedPeers
+
+    // Peers a connected spool was recently a path to (`coveredByInternet`, ADR 2026-09.y5f3). A cover for
+    // DM-form traffic only — the spool carries it for free — and deliberately NOT an election input: a
+    // spool-present board-holder is not a co-pocket rival, and the role must not move on it.
+    @Volatile
+    private var internetPeers: Set<String> = emptySet()
+
+    @Volatile
+    private var currentConfig: LoraConfig? = null
+
+    // Largest Data.payload a single board packet may carry, sized DOWN from the negotiated BLE MTU on
+    // session-up so a full fragment's ToRadio write fits one ATT op (ESP32 boards commonly cap at MTU 255).
+    @Volatile
+    // The pre-Ready floor, not the protocol maximum: frames fanned out while the board is still connecting are
+    // chunked with this and drained the moment the session is Ready, so it has to fit the smallest MTU a real
+    // board negotiates. It used to be MAX_PAYLOAD — every one of those frames then came back TOO_LARGE.
+    private var maxPayload: Int = PRE_READY_PAYLOAD
+
+    // Our own node id, resolved off [selfId] (a suspend read) by [start]. Until it lands, every gate that asks
+    // "is this frame addressed to us?" answers no, so [pacerLoop] takes nothing before it does (#141).
+    private val selfIdKnown = MutableStateFlow<String?>(null)
+    private val selfIdCached: String? get() = selfIdKnown.value
+
+    // Our gateway role, recomputed whenever an OFFER or a foreign-reachable update could change it. ACTIVE
+    // until proven otherwise, so a lone board bridges from the first packet rather than after a gossip round.
+    @Volatile
+    private var role = LoraGatewayPolicy.Role.ACTIVE
+
+    /**
+     * [role], for the `mesh/lab` harness to wait on the election itself. Not [status]: two collectors republish
+     * that snapshot without a lock on every link change, so it can hold a role this field has already left.
+     */
+    internal val gatewayRole: LoraGatewayPolicy.Role get() = role
+
+    // When this gateway last put a post on the foreign public channel, for the per-gateway floor. Monotonic
+    // (`clock`), so it survives a wall-clock jump; NEVER so the first post of a session is never held.
+    private val lastPublicPostAt = AtomicLong(NEVER)
+
+    // The prefix set our last OFFER announced — kept so an inbound OFFER can be recognised as announcing the
+    // same set (the only genuinely redundant one, see LoraGossipPolicy) without re-querying custody.
+    @Volatile
+    private var lastOfferPrefixes: IntArray = IntArray(0)
+
+    // How many frames we have served each far gateway inside the current hour, so one publisher cannot walk
+    // a gateway through its whole custody set by re-offering. The airtime budget is the real bound; this
+    // stops a single peer monopolising it.
+    private val servedTo = ConcurrentHashMap<Long, ServeBudget>()
+
+    /**
+     * Whether a board is configured — the gate the timed loops park on. Mirrors `currentConfig != null`
+     * as a flow, because [gossipLoop] and [lingerSweepLoop] have to *wait* on it rather than poll it.
+     *
+     * Most installs never arm this plane (the child joins the composite on `BuildConfig.LORA_PLANE`
+     * alone, while `SettingsStore.loraEnabled` defaults false), so an ungated loop is a wake-up every
+     * minute, forever, on a plane with no radio behind it.
+     */
+    private val configured = MutableStateFlow(false)
+
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+    private val gossipWake = Channel<Unit>(Channel.CONFLATED)
+
+    /**
+     * Flipped once the persisted limiter state has been applied — or has failed to load, which must cost the
+     * plane an allowance rather than its voice. Everything that can put a packet on the air waits on it
+     * ([awaitRestored]): a frame sent against an empty ledger is exactly the free air [state] exists to stop
+     * handing out. [LoraPlaneState.None] flips it on the first pass.
+     */
+    private val restored = MutableStateFlow(false)
+
+    /** Poked whenever something spends a limiter; [stateSaveLoop] debounces the write behind it. */
+    private val stateWake = Channel<Unit>(Channel.CONFLATED)
+    private val jobs = mutableListOf<Job>()
+
+    /**
+     * A rolling hourly allowance of frames served to one publisher. Not a security boundary — the airtime
+     * budget is that — but it stops a single peer's repeated offers absorbing the whole bridge share while
+     * another pocket goes unserved.
+     */
+    private class ServeBudget {
+        private var windowStart = Long.MIN_VALUE
+        private var spent = 0
+
+        @Synchronized
+        fun take(
+            want: Int,
+            now: Long,
+        ): Int {
+            if (windowStart == Long.MIN_VALUE || now - windowStart >= SERVE_WINDOW_MS) {
+                windowStart = now
+                spent = 0
+            }
+            val grant = minOf(want, SERVE_CAP_PER_HOUR - spent).coerceAtLeast(0)
+            spent += grant
+            return grant
+        }
+
+        @Synchronized
+        fun refund(n: Int) {
+            spent = (spent - n).coerceAtLeast(0)
+        }
+
+        /** This hour's allowance as it stands, or null while none has been opened. */
+        @Synchronized
+        fun snapshot(): ServeWindowState? = if (windowStart == Long.MIN_VALUE) null else ServeWindowState(windowStart, spent)
+
+        @Synchronized
+        fun restore(state: ServeWindowState) {
+            windowStart = state.startMs
+            spent = state.spent
+        }
+    }
+
+    /** One [ServeBudget]'s hour, in the transport's monotonic clock — carried across a restart by [state]. */
+    private data class ServeWindowState(
+        val startMs: Long,
+        val spent: Int,
+    )
+
+    override fun start() {
+        // First, and before anything may transmit: what the previous process spent is still owed to the
+        // window it spent it in.
+        jobs += scope.launch { restoreState() }
+        jobs += scope.launch { stateSaveLoop() }
+        jobs += scope.launch { resolveSelfId() }
+        jobs += scope.launch { config.collect(::onConfig) }
+        jobs += scope.launch { link.state.collect(::onLinkState) }
+        jobs += scope.launch { link.packets.collect(::onLoraPacket) }
+        // Nudge the pacer too: a board that was full is the one state [waitForNextSend] can only wait out on
+        // its floor, and this is the event that ends it.
+        jobs +=
+            scope.launch {
+                link.queue.collect {
+                    it?.let { q ->
+                        pace.onQueueStatus(q.free)
+                        if (q.free > 0) wake.trySend(Unit)
+                    }
+                }
+            }
+        jobs += scope.launch { link.outcomes.collect(::onNak) }
+        jobs += scope.launch { link.battery.collect { publishStatus() } }
+        jobs += scope.launch { pacerLoop() }
+        jobs += scope.launch { lingerSweepLoop() }
+        jobs += scope.launch { gossipLoop() }
+    }
+
+    override fun stop() {
+        jobs.forEach { it.cancel() }
+        jobs.clear()
+        // Taken before [quiesce] empties the serve budgets, and written on the surviving scope: this is the
+        // orderly half of what [stateSaveLoop] covers on a kill, and the ledger it carries is what a restart
+        // must not be handed back for free.
+        val pending = snapshotState()
+        quiesce()
+        scope.launch { writeState(pending) }
+        // Republish, or the row keeps serving the snapshot taken while the plane was up — a signal reading,
+        // a board count and a role for a plane that is no longer running.
+        publishStatus()
+    }
+
+    /**
+     * Drops the board and everything this session heard through it, leaving the plane in the state it has
+     * before it is ever configured. Shared by [stop] and by [onConfig] losing its board, because those are
+     * the same state and used not to be: unpairing only stopped the link, and the heard sets were left for
+     * [lingerSweepLoop] to expire on its next pass.
+     *
+     * That is what makes parking the sweep safe. [recomputeReachable] is the only thing that ages
+     * [lastHeardAt] / [boardsHeardAt] out, so a loop that idles while unconfigured would otherwise strand
+     * whatever the last board heard in `reachable` — forever, since nothing else ever shrinks it. Clearing
+     * here rather than waiting out `REACHABLE_LINGER_MS` is also the more honest answer: the route those
+     * peers were reachable *through* is gone the moment the board is.
+     */
+    private fun quiesce() {
+        configured.value = false
+        link.stop()
+        lastHeardAt.clear()
+        heardPeers.clear()
+        heardVia.clear()
+        boardOwners.clear()
+        // Takes the signal readings with it: they belong to radios this session heard, and a stale one used
+        // to survive a restart and read as the state of a link that had not been re-established yet.
+        boardsHeardAt.clear()
+        gateway.forget()
+        servedTo.clear()
+        // A restart must not inherit a deferral to a board that may no longer be there.
+        role = LoraGatewayPolicy.Role.ACTIVE
+        lastOfferPrefixes = IntArray(0)
+        _reachable.value = emptySet()
+        _health.value = TransportHealth.Unavailable
+    }
+
+    /**
+     * Parks a timed loop until a board is configured. The plane's own gate, not the link's: a configured
+     * board that is merely disconnected still has sweeping and gossiping to do, and both loops already
+     * handle a down link on their own.
+     */
+    private suspend fun awaitConfigured() {
+        configured.first { it }
+    }
+
+    /**
+     * Reads our own node id into [selfIdKnown] (everything that transmits waits on it), retrying a read that
+     * throws: the production source is the identity's Keystore-backed key, which can refuse (ADR 2026-10.47rw),
+     * and a refused read must cost the plane a delay, not leave the pacer parked for the life of the process.
+     */
+    private suspend fun resolveSelfId() {
+        var wait = SELF_ID_RETRY_MIN_MS
+        while (true) {
+            val read = runCatching { selfId() }
+            read.exceptionOrNull()?.let { e ->
+                if (e is CancellationException) throw e
+                log("lora self id unavailable (${e.javaClass.simpleName}); retrying in ${wait}ms")
+            }
+            val id = read.getOrNull()
+            if (id != null) {
+                selfIdKnown.value = id
+                recomputeRole()
+                return
+            }
+            delay(wait)
+            wait = (wait * 2).coerceAtMost(SELF_ID_RETRY_MAX_MS)
+        }
+    }
+
+    /**
+     * Parks until [restoreState] has applied the previous process's limiters. Everything that can put a
+     * packet on the air waits here — the pacer, the gossip loop and the profile beacon — because the whole
+     * point of persisting a ledger is that nothing spends against the empty one first.
+     */
+    private suspend fun awaitRestored() {
+        restored.first { it }
+    }
+
+    // --- limiters that outlive the process (LoraPlaneState) ---
+
+    /**
+     * Reads the limiter state the last process left and applies it, then releases [awaitRestored] — always,
+     * including on a store that is missing, slow or broken. A plane that stays silent because a preferences
+     * read failed would be a far worse trade than the fresh window it is avoiding.
+     */
+    private suspend fun restoreState() {
+        // Once per instance. A stop/start inside one process still holds the live ledger, and re-reading
+        // would replace it with a blob up to one debounce older — or, if [stop]'s write has not landed yet,
+        // with the one before that.
+        if (restored.value) return
+        try {
+            withTimeoutOrNull(STATE_LOAD_TIMEOUT_MS) {
+                runCatching { state.load() }
+                    .onFailure { log("lora state load failed: ${it.message}") }
+                    .getOrNull()
+            }?.let(::applyState)
+        } finally {
+            restored.value = true
+        }
+    }
+
+    private fun applyState(snapshot: LoraPlaneSnapshot) {
+        val nowWall = wallClock()
+        if (nowWall < snapshot.savedAtWall) {
+            // The wall clock moved backwards — a manual change, or an NTP correction over a reboot. Every age
+            // in the snapshot would come out negative, i.e. in the future, and would then never expire; one
+            // fresh window is much the smaller error.
+            log("lora state: wall clock is behind the snapshot, limiters start clean")
+            return
+        }
+        val now = clock()
+        val shift = WallShift(now, nowWall)
+        pace.airtime.restore(
+            snapshot.air.mapNotNull { booking ->
+                AirBucket.entries
+                    .firstOrNull { it.name == booking.bucket }
+                    ?.let { Booking(shift.toMono(booking.atWall), booking.ms, it) }
+            },
+            now,
+        )
+        snapshot.selfProfileAtWall?.let { lastSelfProfileAt.set(shift.toMono(it)) }
+        snapshot.serve.forEach {
+            servedTo.getOrPut(it.publisher) { ServeBudget() }.restore(ServeWindowState(shift.toMono(it.startWall), it.spent))
+        }
+        profileSeen.restore(snapshot.profileSeen.map { it.id to shift.toMono(it.atWall) })
+        autoReply.restore(snapshot.autoReplied.map { it.id to shift.toMono(it.atWall) })
+        dmProbeAt.restore(snapshot.dmProbes.map { it.id to shift.toMono(it.atWall) }, now)
+        reofferedAt.restore(snapshot.reoffered.map { it.id to shift.toMono(it.atWall) })
+        val air = pace.airtime.snapshot(now)
+        log(
+            "lora state restored: air=${air.totalUsedMs}/${air.liveBudgetMs}ms " +
+                "serve=${snapshot.serve.size} profiles=${snapshot.profileSeen.size} autoReplied=${snapshot.autoReplied.size} " +
+                "probes=${snapshot.dmProbes.size} reoffered=${snapshot.reoffered.size}",
+        )
+    }
+
+    private fun snapshotState(): LoraPlaneSnapshot {
+        val now = clock()
+        val nowWall = wallClock()
+        val shift = WallShift(now, nowWall)
+        return LoraPlaneSnapshot(
+            savedAtWall = nowWall,
+            air = pace.airtime.bookings(now).map { AirBooking(shift.toWall(it.atMs), it.ms, it.bucket.name) },
+            selfProfileAtWall = lastSelfProfileAt.get().takeIf { it != NEVER }?.let(shift::toWall),
+            serve =
+                servedTo.mapNotNull { (publisher, budget) ->
+                    budget.snapshot()?.let { ServeWindow(publisher, shift.toWall(it.startMs), it.spent) }
+                },
+            // Newest first, capped: the gate is per profile *publish*, so a pocket produces a handful a day —
+            // but the set it lives in holds thousands, and none of that belongs in a preferences blob.
+            profileSeen = profileSeen.stamps().takeLast(STATE_PROFILE_CAP).map { SeenStamp(it.first, shift.toWall(it.second)) },
+            // The DM auto-reply's once-a-day memory: the board replays its queue on reconnect, and a restart
+            // that forgot who was answered would answer the same message again.
+            autoReplied = autoReply.stamps().takeLast(STATE_AUTO_REPLY_CAP).map { SeenStamp(it.first, shift.toWall(it.second)) },
+            // The reach gate's probe window (ADR 2026-10.a4pm): forgotten on launch, every restart would buy each
+            // unheard recipient another DM's worth of air.
+            dmProbes = dmProbeAt.stamps(now).takeLast(STATE_DM_PROBE_CAP).map { SeenStamp(it.first, shift.toWall(it.second)) },
+            // And the re-offer's per-frame hour: forgotten, every restart would re-air the backlog on first hearing.
+            reoffered = reofferedAt.stamps().takeLast(STATE_REOFFER_CAP).map { SeenStamp(it.first, shift.toWall(it.second)) },
+        )
+    }
+
+    /**
+     * Persists the limiters a beat after something spends them. Conflated and debounced rather than written
+     * per booking: the pacer's 3-second floor already bounds how often this can fire, and coalescing a
+     * fragmented frame's packets into one write keeps a burst off the disk. The window it leaves is one
+     * debounce wide — a process killed inside it loses the last packet or two of the ledger, which is the
+     * same order of error as the governor's own estimate of what a packet costs.
+     */
+    private suspend fun stateSaveLoop() {
+        while (scope.isActive) {
+            stateWake.receive()
+            delay(STATE_SAVE_DEBOUNCE_MS)
+            writeState(snapshotState())
+        }
+    }
+
+    private suspend fun writeState(snapshot: LoraPlaneSnapshot) {
+        runCatching { state.save(snapshot) }.onFailure { log("lora state save failed: ${it.message}") }
+    }
+
+    override fun heal() {
+        // No rescan to trigger — the board session self-heals with its own backoff. Nudge the pacer in case
+        // a frame is queued behind a stale gap.
+        wake.trySend(Unit)
+    }
+
+    /** Sightings from the short-range planes. Recorded for the diagnostics dump; never routed on — see the field. */
+    override fun onForeignReachable(peers: Set<String>) {
+        foreignReachable = peers
+        publishStatus()
+    }
+
+    /**
+     * The peers BLE/NAN currently hold a live link to. This plane has no data path of its own, so the hint's
+     * usual meaning (don't bring up a redundant sync) is moot — what it is read for here is the **gateway
+     * election**: standing down is only safe toward a board that can actually be handed our traffic.
+     */
+    override fun suppressDataPath(peers: Set<String>) {
+        linkedPeers = peers
+        // A co-pocket gateway gaining or losing its link is exactly what changes who speaks for this pocket.
+        recomputeRole()
+        // ...and whose board's hearings still count as reach: a radio that just joined our pocket vouches for
+        // nobody on the LoRa hop any more (ADR 2026-09.6gk8).
+        recomputeReachable(clock())
+    }
+
+    override fun coveredByInternet(peers: Set<String>) {
+        internetPeers = peers
+        publishStatus() // no recomputeRole(): a cover, never an election input
+    }
+
+    /**
+     * Sets the connected board up for Knit — the one-tap alternative to configuring a Meshtastic board by
+     * hand. On [ProvisionResult.Provisioned] the settings VM persists the returned index so this plane binds
+     * to it, along with the intervals the board had before so a restore can put them back. Requires a Ready
+     * link.
+     */
+    override suspend fun provisionKnitChannel(
+        mode: ProvisionMode,
+        previous: BoardSettings?,
+    ): ProvisionResult = link.provisionChannel(ProvisionSpec(KnitChannel.NAME, KnitChannel.PSK, mode, previous))
+
+    // --- outbound (fast plane only) ---
+
+    override fun fastFanout(wire: WireEnvelope) = fanout(wire, "fanout", FanoutHint.CONTENT)
+
+    override fun longRangeFanout(
+        wire: WireEnvelope,
+        hint: FanoutHint,
+    ) = fanout(wire, "far", hint)
+
+    /**
+     * The one fan-out: the composite's coordination-plane blast ([fastFanout] — room + cleartext metadata) and
+     * its long-range sibling ([longRangeFanout] — sealed DM-form chat, ADR 039) both land here, and
+     * [LoraFramePolicy] is the single gate for what rides.
+     */
+    private fun fanout(
+        wire: WireEnvelope,
+        label: String,
+        hint: FanoutHint,
+    ) {
+        if (!mayTransmit()) return // no board of our own, or a pocket-mate is the gateway and will carry this
+        val env = WireCodec.decodeEnvelope(wire.signed) ?: return
+        if (env.type == FrameType.PROFILE && env.senderId == selfIdCached) {
+            sendSelfProfile(wire) // shares the beacon's floor so the two never double-send
+            return
+        }
+        if (!LoraFramePolicy.eligible(env, wire, LoraFramePolicy.Path.FANOUT)) return
+        if (LoraFramePolicy.isDmForm(env) && currentConfig?.dms != true) return // the user keeps DMs off this plane
+        if (skipCovered(env)) return // a live link or a spool carries it; a ~1 kbps medium must not pay twice
+        if (!LoraFramePolicy.isFresh(env, wallClock())) {
+            metrics.onLoraSuppressed() // a custody re-serve of an old frame — custody's business, not a live plane's
+            return
+        }
+        // The reach gate (ADR 2026-10.a4pm), before the dedup slot like the covers: a DM-form frame to someone
+        // this plane has not heard is held in custody, and their first hearing re-offers it — except one plain
+        // DM per recipient per window, which goes out as the probe whose ✓✓ makes them heard.
+        when (val reach = reachGate(env, hint)) {
+            Reach.Held -> metrics.onLoraUnheardHeld()
+            Reach.Exempt -> admitFanout(wire, env, label, hint, reachGated = false, probe = null)
+            Reach.Heard -> admitFanout(wire, env, label, hint, reachGated = true, probe = null)
+            is Reach.Probe -> admitFanout(wire, env, label, hint, reachGated = false, probe = reach.claim)
+        }
+    }
+
+    /** What [reachGate] decided for a fanned frame. */
+    private sealed interface Reach {
+        /** Not a frame the gate asks about: not DM-form, our own frame other than a DM, or our id unknown ([reachGate]). */
+        data object Exempt : Reach
+
+        /** DM-form and gated, and its addressee is heard: it rides, and is re-asked at send ([RideGate.reachGated]). */
+        data object Heard : Reach
+
+        /** DM-form to an unheard addressee, and no probe to spend on it: custody keeps it for the re-offer. */
+        data object Held : Reach
+
+        /** Our own DM to an unheard addressee, riding as the window's probe on [claim]. */
+        class Probe(
+            val claim: LoraDmProbe.Claim,
+        ) : Reach
+    }
+
+    /**
+     * The reach gate's verdict for a fanned frame (ADR 2026-10.a4pm), keyed on the originator's [hint] because
+     * the plane cannot read a sealed frame:
+     *
+     * - our own DM ([FanoutHint.CHAT]) is gated, and may probe — it is the one frame that draws a ✓✓ back;
+     * - any other frame of our own is **not** gated. Our ✓✓ ([FanoutHint.TICK]) exists only because its author's
+     *   DM just reached us, so it is evidence-driven by construction, about one packet, and nothing would re-offer
+     *   it if held (it has no message row) — held, the author would show one tick until radio or spool contact. Our
+     *   sealed ctls ([FanoutHint.CONTENT]: a reaction, a session reset, a seed or key reply, the post-reset re-seal)
+     *   are in the same position: no row to re-offer from, no ✓✓ to probe with;
+     * - a relayed DM-form frame is opaque and gated, re-offered from custody on a first hearing. It may take the
+     *   probe only when its author is a pocket-mate we hold a live link to ([mayProbe]);
+     * - until our own id is known nothing is gated: ours cannot be told from a stranger's, and the send-time
+     *   re-ask still refuses a frame addressed to us once the pacer has the id (#141).
+     *
+     * Never a probe before the last process's stamps are back either: claimed against an empty window, a DM sent
+     * in the launch's first moments would buy the recipient a second probe inside the one it spent.
+     */
+    private fun reachGate(
+        env: RelayEnvelope,
+        hint: FanoutHint,
+    ): Reach {
+        if (!LoraFramePolicy.isDmForm(env)) return Reach.Exempt
+        // Not knowing who we are, we cannot tell our own ctl from a stranger's DM: let it through as it always went,
+        // and the send-time re-ask (the pacer waits for the id) still refuses one addressed to us (#141).
+        val self = selfIdCached ?: return Reach.Exempt
+        val own = env.senderId == self
+        if (own && hint != FanoutHint.CHAT) return Reach.Exempt
+        val to = unheardRecipient(env) ?: return Reach.Heard
+        if (!mayProbe(env, own) || !restored.value) return Reach.Held
+        return dmProbeAt.claim(to, clock())?.let(Reach::Probe) ?: Reach.Held
+    }
+
+    /**
+     * Whether a gated frame may spend the probe: our own DM, or — as the gateway — a DM-form frame from a
+     * pocket-mate we hold a live link to. A board-less pocket-mate's DM reaches the air only through us, and
+     * relayed it carries no hint, so without this its DMs to a quiet far peer would wait for a hearing nothing
+     * provokes. The gateway cannot tell that pocket-mate's DM from their tick or ctl: a probe spent on one buys
+     * no ✓✓, and the next window probes again (ADR 2026-10.a4pm's residual).
+     */
+    private fun mayProbe(
+        env: RelayEnvelope,
+        own: Boolean,
+    ): Boolean = own || env.senderId in linkedPeers // only a CHAT DM of ours reaches here
+
+    /**
+     * The fan-out past its gates: encode, the profile and signature dedup, and the queue. [probe] is the window
+     * the reach gate claimed for this frame, handed back if it never reaches the queue — a frame that cannot be
+     * encoded, was deduplicated or was refused must not spend it.
+     */
+    private fun admitFanout(
+        wire: WireEnvelope,
+        env: RelayEnvelope,
+        label: String,
+        hint: FanoutHint,
+        reachGated: Boolean,
+        probe: LoraDmProbe.Claim?,
+    ) {
+        val parts = encodeOrNull(wire, "$label:${env.type}")
+        if (parts == null) {
+            probe?.let(dmProbeAt::release)
+            return
+        }
+        // Checked before [sigSeen] deliberately: a profile held back here must leave the signature slot free,
+        // because the bridge's digest-driven backfill is the path that repairs a lost one and it takes that
+        // slot for itself (serveOne). Both come after encodeOrNull for the same reason — a frame that cannot
+        // be encoded must not consume a window it never rode.
+        if (env.type == FrameType.PROFILE) {
+            if (!profileSeen.add(env.id)) {
+                metrics.onLoraProfileRefanSkipped()
+                return
+            }
+            // The gate outlives the process (12 h against a launch that may last minutes), so a publish it
+            // has just taken is worth persisting rather than leaving to the send that follows.
+            stateWake.trySend(Unit)
+        }
+        val key = dedupKey(wire, env)
+        if (!sigSeen.add(key)) {
+            probe?.let(dmProbeAt::release)
+            metrics.onLoraSuppressed() // already sent/received over LoRa within the window
+            return
+        }
+        val dmForm = LoraFramePolicy.isDmForm(env)
+        val accepted =
+            enqueue(
+                parts,
+                "$label:${env.type}",
+                classOf(env, hint),
+                supersedes = supersedeKeyFor(env),
+                // All the gates above are answered about the mesh as it is *now*; the frame may not fly for a
+                // whole window. Carried so [staleReason] can ask them again on the way out — the reach gate
+                // only of a frame that passed it, never of the probe, which flew because the answer was no.
+                gate =
+                    RideGate(
+                        recipientId = env.recipientId?.takeIf { dmForm },
+                        freshUntil = freshUntilFor(env),
+                        roleGated = true,
+                        reachGated = reachGated,
+                    ),
+                sigKey = key,
+                probe = probe,
+            )
+        probe?.let { settleProbe(it, accepted, "$label:${env.type}") }
+    }
+
+    /** Books a probe that reached the queue; one the queue refused was given back by [abandon]. */
+    private fun settleProbe(
+        probe: LoraDmProbe.Claim,
+        accepted: Boolean,
+        label: String,
+    ) {
+        if (!accepted) return // refused: the pacer handed it back and [abandon] already released the window
+        metrics.onLoraDmProbe()
+        stateWake.trySend(Unit) // a limiter that outlives the process; persist what it just spent
+        log("lora probe $label -> ${probe.recipientId}")
+    }
+
+    /**
+     * The addressee of a DM-form [env] this plane has not heard within the linger, or null when [env] is not
+     * DM-form or its addressee is in [reachable] (ADR 2026-10.a4pm). Author-keyed reach, as everywhere on this
+     * plane: a recipient we hear only through a far gateway's airing, or through a Meshtastic repeater, is
+     * heard — that airing is the route the frame would take back.
+     */
+    private fun unheardRecipient(env: RelayEnvelope): String? {
+        if (!LoraFramePolicy.isDmForm(env)) return null
+        val to = env.recipientId ?: return null
+        return to.takeUnless { heard(it) }
+    }
+
+    private fun heard(nodeId: String): Boolean = _reachable.value.any { it.nodeId == nodeId }
+
+    /**
+     * The [OutboundFrame.supersedes] key for a fanned frame, or null for one that is an event rather than a
+     * state.
+     *
+     * A profile is a snapshot of its author's current keys and the far side takes newest-wins, so an older copy
+     * still queued is the wrong answer waiting to be sent first. That is the path the lab backlog came down —
+     * 28 of them, ahead of every OFFER, forever. A DM-form frame gets its own [frameKey], so that every copy
+     * of it in the queue is one copy (ADR 2026-10.a4pm).
+     */
+    private fun supersedeKeyFor(env: RelayEnvelope): String? =
+        when {
+            env.type == FrameType.PROFILE -> profileKey(env.senderId)
+            LoraFramePolicy.isDmForm(env) -> frameKey(env)
+            else -> null
+        }
+
+    /**
+     * One key for every copy of one DM-form frame the plane might queue — the fan-out's, the bridge's serve
+     * and the first-hearing re-offer — so a re-offer can lift a copy still waiting in the queue onto its own
+     * bucket ([LoraPacePolicy.upgradeQueued], ADR 2026-10.a4pm) instead of being turned away by the dedup slot
+     * that copy took. Room posts keep none: nothing re-offers them.
+     */
+    private fun frameKey(env: RelayEnvelope): String = "frame:${env.id}"
+
+    override fun fastSend(
+        wire: WireEnvelope,
+        to: Peer,
+    ) {
+        // Deliberately NOT gated on the gateway role. A targeted send is `relay = false`: only this node owes
+        // it, it is never flooded, and a co-pocket gateway therefore has no copy of it to relay and no copy to
+        // duplicate. Suppressing it was pure loss — it stranded AckSync's ✓✓ ticks on a passive board, which
+        // retries them for 24 h and never lands one.
+        if (to.nodeId !in _reachable.value.mapTo(HashSet()) { it.nodeId }) return
+        // "Another plane carries this peer's traffic" (ADR 039) means a **link**, not a sighting: a peer BLE
+        // has merely heard advertise, or one Wi-Fi Aware still lists 150 s after its last cue, is being
+        // carried by nothing. Read as a sighting this refused the one path a far peer's ✓✓ had — the same
+        // reachable-vs-linked error as the gateway election, and the second reason the field test lost its
+        // receipts even once the role was right.
+        if (to.nodeId in linkedPeers) return
+        // The first gate `fastSend` has had since ADR 044 said it must have none, and a different kind: the
+        // role gate was refused because a passive board holds no copy to relay, while a cover says the peer
+        // demonstrably has a path that costs nothing (ADR 2026-09.y5f3). Re-asked on the way out, too.
+        if (to.nodeId in internetPeers) {
+            metrics.onLoraSkippedInternet()
+            return
+        }
+        val env = WireCodec.decodeEnvelope(wire.signed) ?: return
+        if (!LoraFramePolicy.eligible(env, wire, LoraFramePolicy.Path.TARGETED, to.nodeId)) return
+        val label = "send:${env.type}->${to.nodeId}"
+        val parts = encodeOrNull(wire, label) ?: return
+        if (!sigSeen.add(targetedKey(wire, env, to))) return
+        // The targeted path admits only receipts and sealed ticks (LoraFramePolicy), so it needs no hint.
+        // Recipient only: the role gate is deliberately absent here and must stay absent on the way out too,
+        // for the reason the comment above gives — this send is owed by exactly one node.
+        enqueue(parts, label, classOf(env, FanoutHint.TICK), gate = RideGate(recipientId = to.nodeId))
+    }
+
+    override suspend fun send(
+        wire: WireEnvelope,
+        to: Peer?,
+    ) = Unit // LoRa is fast-plane only; the reliable flood never rides it
+
+    override suspend fun sendFile(
+        file: File,
+        to: Peer,
+        meta: app.getknit.knit.mesh.FileMeta,
+    ): Boolean = false // no bulk transfers over LoRa
+
+    /**
+     * Compacts + fragments [wire] for the hop, or null when it can't ride (counted `loraTooBig`). Deliberately
+     * separate from [enqueue] and called **before** the sig dedup: recording the sig first would burn the
+     * frame's 10-minute dedup slot on a frame that never went out, so a later re-offer or backfill of the
+     * same frame would be silently suppressed rather than retried.
+     */
+    private fun encodeOrNull(
+        wire: WireEnvelope,
+        label: String,
+    ): List<ByteArray>? {
+        // `transcode = true` unconditionally is the ADR 060 flag-day: this plane has no per-peer capability (a
+        // LoRa sighting carries caps 0 and the OFFER has no field for them), and it ships debug-only. Before it
+        // ships to release this needs a gate — every peer heard on the plane advertising the bit through the
+        // profile frame it beacons here — recorded in the roadmap; an older debug build on the channel drops
+        // 0x05 as UNKNOWN_TAG until then.
+        val encoded =
+            LoraFrameCodec.encodeBest(
+                wire,
+                fragSeq.getAndIncrement() and FRAG_ID_MASK,
+                maxPayload,
+                transcode = true,
+                // ADR 2026-09.mhs5: the governor prices the packet against this board's own preset and firmware, so a
+                // frame under the 2.8 signature cliff is grown past it and leaves cheaper than it arrived.
+                cost = pace.airtime,
+            )
+        if (encoded == null) {
+            metrics.onLoraTooBig()
+            log("lora too-big $label")
+            return null
+        }
+        if (encoded.transcodeRefused) metrics.onTranscodeFallback()
+        if (encoded.transcoded) metrics.onLoraTranscoded()
+        if (encoded.grewBy > 0) {
+            metrics.onLoraPadded()
+            log("lora pad $label +${encoded.grewBy}B past the signature cliff")
+        }
+        return encoded.parts
+    }
+
+    private fun enqueue(
+        parts: List<ByteArray>,
+        label: String,
+        klass: FrameClass,
+        bucket: AirBucket = AirBucket.defaultFor(klass),
+        destination: Destination = Destination.Knit,
+        supersedes: String? = null,
+        gate: RideGate = RideGate(),
+        to: UInt = MeshtasticProto.BROADCAST,
+        sigKey: String? = null,
+        probe: LoraDmProbe.Claim? = null,
+    ): Boolean =
+        enqueue(
+            OutboundFrame(parts, label, klass, bucket, destination, to, supersedes, gate, probe = probe, sigKey = sigKey),
+        )
+
+    /**
+     * Queues [frame] and says whether it is in the queue now. [LoraPacePolicy.Admission.DROPPED_OLDEST] is in:
+     * it shed an older frame to make room (counted `loraDroppedQueue`, as ever), and the newcomer waits.
+     */
+    private fun enqueue(frame: OutboundFrame): Boolean {
+        val admission = pace.enqueue(frame)
+        if (admission != LoraPacePolicy.Admission.ACCEPTED) metrics.onLoraDroppedQueue()
+        abandonShed() // the frame this one displaced, if it shed one
+        if (pace.lastSuperseded > 0) log("lora ${frame.label} superseded ${pace.lastSuperseded} still queued")
+        wake.trySend(Unit)
+        return admission != LoraPacePolicy.Admission.REFUSED
+    }
+
+    /**
+     * The pacing class of a frame: the profile is the key bootstrap, a DM outranks ambient room traffic, and a
+     * sealed tick the originator has vouched for ([FanoutHint.TICK]) ranks below everything — feedback, not
+     * content (ADR 054). A relayed DM-form frame is opaque and stays DM class whatever it really is.
+     */
+    private fun classOf(
+        env: RelayEnvelope,
+        hint: FanoutHint,
+    ): FrameClass =
+        when {
+            env.type == FrameType.PROFILE -> FrameClass.BOOTSTRAP
+            LoraFramePolicy.isDmForm(env) -> if (hint == FanoutHint.TICK) FrameClass.TICK else FrameClass.DM
+            else -> FrameClass.ROOM
+        }
+
+    // --- the profile beacon (key bootstrap) ---
+
+    private fun sendSelfProfile(
+        wire: WireEnvelope,
+        minGapMs: Long = PROFILE_FLOOR_MS,
+    ) {
+        if (!mayTransmit()) return
+        if (!profileGapElapsed(clock(), minGapMs)) return
+        val parts = encodeOrNull(wire, "profile-self") ?: return
+        lastSelfProfileAt.set(clock())
+        stateWake.trySend(Unit)
+        sigSeen.add(sigKey(wire))
+        enqueue(
+            parts,
+            "profile-self",
+            FrameClass.BOOTSTRAP,
+            supersedes = profileKey(selfIdCached),
+            gate = RideGate(roleGated = true),
+        )
+    }
+
+    /**
+     * Beacons the signed self profile unless one went out within [minGapMs]. One timestamp, two gaps: session-up
+     * keeps the 5-min floor, while a first hearing needs only a 60-s gap — the peer that just appeared has
+     * demonstrably never heard us, and without a periodic beacon this is the only way a late arrival learns our
+     * key (A beaconed two minutes ago, B just came up: A must speak again or B's parked frames expire).
+     */
+    private suspend fun beaconProfile(minGapMs: Long) {
+        // The floor is only a floor once it has been read back: session-up is the very moment a restart used
+        // to beacon into, whatever the last process had already put on the air.
+        awaitRestored()
+        // And the beacon's supersede key is our id: queued under a null one, it and a fan-out of the same
+        // publish would never replace each other, and both would air inside the floor.
+        selfIdKnown.first { it != null }
+        if (!profileGapElapsed(clock(), minGapMs)) return // check before the (potentially costly) profile build
+        val wire = selfProfile() ?: return
+        sendSelfProfile(wire, minGapMs)
+    }
+
+    /**
+     * Re-offers the carried DM-form frames addressed to [peer] — pulled through [farFrames] (custody, via
+     * [app.getknit.knit.mesh.FarPeerFrameSource]) — on first hearing it (ADR 039): this plane has no custody
+     * sync, so a DM sent while the peer's board was off — or held by the reach gate because it was not heard
+     * (ADR 2026-10.a4pm) — is otherwise lost to it until radio contact. Bounded by the source (our newest few
+     * unacked DMs and a few relayed frames), the sig-keyed dedup (a frame fanned inside the window is skipped)
+     * and the 45-min linger (a peer is "first heard" at most once per window). Skipped for a peer another plane already
+     * carries — it gets custody's real digest sync there.
+     */
+    private suspend fun reofferTo(peer: Peer) {
+        if (!mayTransmit()) return
+        // Links, not sightings, for the same reason: the re-offer is skipped because custody syncs to this
+        // peer for real elsewhere, and `ForwardSync`'s digest exchange runs off `neighbors` — a sighting
+        // never triggers it, so skipping on one strands the very DMs this path exists to deliver.
+        if (currentConfig?.dms != true || peer.nodeId in linkedPeers) return
+        if (peer.nodeId in internetPeers) {
+            metrics.onLoraSkippedInternet() // the spool re-serves to this peer for real, and for free
+            return
+        }
+        farFrames(peer.nodeId).forEach { wire -> reofferOne(wire, peer.nodeId) }
+    }
+
+    /**
+     * Enqueues one re-offered frame if it is a DM-form chat addressed to [to], not re-offered within the hour
+     * ([reofferedAt]) and not fanned inside the dedup window — or, if a copy the bridge queued holds that window
+     * and waits on another bucket, lifts that copy onto this one ([LoraPacePolicy.upgradeQueued]).
+     */
+    private fun reofferOne(
+        wire: WireEnvelope,
+        to: String,
+    ) {
+        val env = WireCodec.decodeEnvelope(wire.signed) ?: return
+        if (!LoraFramePolicy.isDmForm(env) || env.recipientId != to) return
+        // Once an hour per frame across first hearings (ADR 2026-10.a4pm): a recipient that hears us but that we
+        // hear only now and then is "first heard" every linger cycle, and would have the same backlog re-aired
+        // every 45 minutes.
+        if (reofferedAt.contains(env.id)) return
+        val label = "reoffer:${env.id}"
+        val parts = encodeOrNull(wire, label) ?: return
+        val key = dedupKey(wire, env)
+        // DM class so a room post can never evict it. LIVE for a frame that was a live send held back by the reach
+        // gate (ADR 2026-10.a4pm): our own, or a board-less pocket-mate's we were the gateway for. Anything else
+        // stays on BRIDGE, metered as the backfill it is. [reofferTo] asked the role, this peer's link and — by
+        // running on a first hearing — its reach, so all three are re-asked.
+        val live = env.senderId == selfIdCached || env.senderId in linkedPeers
+        val frame =
+            OutboundFrame(
+                parts,
+                label,
+                FrameClass.DM,
+                if (live) AirBucket.LIVE else AirBucket.BRIDGE,
+                supersedes = frameKey(env),
+                gate = RideGate(recipientId = to, roleGated = true, reachGated = true),
+                reofferId = env.id,
+                sigKey = key,
+            )
+        if (sigSeen.add(key)) {
+            if (!enqueue(frame)) return
+        } else if (pace.upgradeQueued(frame)) {
+            // The bridge served it first, onto a share it may have spent: the slot is that copy's, so the
+            // re-offer takes its place instead (never a part-sent one — the pacer refuses).
+            log("lora $label lifted a queued copy onto ${frame.bucket}")
+            wake.trySend(Unit)
+        } else {
+            return // in flight, already aired inside the window, or already queued on this bucket
+        }
+        reofferedAt.add(env.id)
+        stateWake.trySend(Unit)
+        metrics.onLoraReoffered()
+    }
+
+    // --- the bridge: gateway role, gossip, backfill (ADR 044) ---
+
+    /**
+     * Recomputes whether this phone speaks for its pocket. Cheap and idempotent, so it runs on every input
+     * that could change the answer: an inbound OFFER (a rival appeared) and a foreign-reachable update (one
+     * arrived in, or left, our BLE/NAN clique).
+     */
+    private fun recomputeRole() {
+        val self = selfIdCached ?: return
+        val next = gateway.roleFor(StoreDigest.hash64(self), pocketKeys(), clock())
+        if (next == role) return
+        role = next
+        log("lora role $next (links=${linkedPeers.size} gateways=${gateway.heard})")
+        publishStatus()
+    }
+
+    /**
+     * The pocket, for election purposes: peers a short-range plane holds a **live link** to.
+     *
+     * Deliberately [linkedPeers] and not [foreignReachable]. The latter is a *sighting* — BLE publishes
+     * presence adverts ∪ links, and Wi-Fi Aware keeps a 150-second ghost after the last cue — and its own
+     * kdoc says "not necessarily linked here". Electing on it strands a board: two phones that can hear each
+     * other's adverts across a field, with no L2CAP link between them, would have the higher-keyed one stand
+     * down for a peer that never receives, let alone relays, a single frame of its traffic. Standing down is
+     * only ever safe toward a board our frames can actually be handed to.
+     */
+    private fun pocketKeys(): Set<Long> = linkedPeers.mapTo(HashSet()) { StoreDigest.hash64(it) }
+
+    /**
+     * Whether the bound slot really is the Knit channel. Since ADR 045 a board is either set up for Knit or a
+     * stock Meshtastic node, so a bound slot carrying anything else means the setup was undone or never run —
+     * and transmitting there would put Knit's cleartext frames onto somebody else's channel, most likely the
+     * public one every stock radio listens to. Silence is the only safe reading of that.
+     *
+     * A board that reports no channel table at all is given the benefit of the doubt: going mute on firmware
+     * whose table we failed to read would be a worse failure than the one this guards against.
+     *
+     * Takes [channels] rather than reading the link itself, because "the board is between sessions" is not an
+     * answer to this question and must never be confused with one: a disconnected link used to fail here and
+     * cost the frame, when the only correct handling of it is to put the frame back — see [sendFrame].
+     */
+    private fun boundSlotIsKnit(
+        channels: List<ChannelInfo>,
+        index: Int,
+    ): Boolean = channels.isEmpty() || channels.any { it.index == index && it.name == KnitChannel.NAME }
+
+    /**
+     * Whether a DM-form frame is addressed to us, or to a peer a higher-preference plane holds a **live link**
+     * to (ADR 054). Either way it already has a data path — the BLE/NAN flood, or it is ours and delivered — so
+     * a ~1 kbps medium buys nothing by carrying it. Before this gate, texting a pocket-mate over Bluetooth
+     * spent the whole airtime budget on DMs and ✓✓s that never needed the board (the composite's
+     * [longRangeFanout] is unconditional and the gateway re-fans every relayed DM-form frame), and a far peer
+     * then went without for the rest of the window.
+     *
+     * Links, never sightings — the same reading as the election and [fastSend]: a sighting is not a data path,
+     * and refusing on one would take away a far peer's only route (ADR 044's field amendment).
+     */
+    private fun coveredByLink(env: RelayEnvelope): Boolean {
+        if (!LoraFramePolicy.isDmForm(env)) return false
+        val to = env.recipientId ?: return false
+        return to == selfIdCached || to in linkedPeers
+    }
+
+    /**
+     * The second cover (ADR 2026-09.y5f3): a DM-form frame whose addressee a connected spool was recently a
+     * path to. Counted apart from [coveredByLink] so the two reasons a frame stayed off the air can be told
+     * apart in the field.
+     */
+    private fun coveredByInternet(env: RelayEnvelope): Boolean {
+        if (!LoraFramePolicy.isDmForm(env)) return false
+        val to = env.recipientId ?: return false
+        return to in internetPeers
+    }
+
+    /** Both covers at once, each counted under its own name; true means the caller must not put [env] on air. */
+    private fun skipCovered(env: RelayEnvelope): Boolean {
+        if (coveredByLink(env)) {
+            metrics.onLoraSkippedLinked()
+            return true
+        }
+        if (coveredByInternet(env)) {
+            metrics.onLoraSkippedInternet()
+            return true
+        }
+        return false
+    }
+
+    /**
+     * When [LoraFramePolicy.isFresh] would start refusing [env], or null for a type it exempts. The gate is a
+     * deadline rather than an age, so the queue can carry it without carrying the envelope.
+     */
+    private fun freshUntilFor(env: RelayEnvelope): Long? =
+        if (LoraFramePolicy.freshnessExempt(env)) null else env.sentAt + LoraFramePolicy.FRESH_MS
+
+    /**
+     * Why a frame the pacer just handed us should no longer go on the air, or null to send it.
+     *
+     * The enqueuing path asked these same questions, but the queue is a time-delayed commitment — the pacing
+     * floor, a full board queue and a spent airtime share can hold a frame for a whole window — and the
+     * answers move underneath it. Field-observed 2026-09-09: a phone that had been alone for hours met two
+     * peers on Wi-Fi Aware, queued their receipts in the four seconds before the second link came up, and
+     * then spent its entire 45-second allowance putting on the air what that link had already delivered. The
+     * far side confirmed it, receiving one frame id over Wi-Fi Aware and the same one over LoRa ten minutes
+     * later.
+     *
+     * Only [RideGate]'s own questions are asked, so this can never refuse a frame its path did not already
+     * gate — which is what keeps ADR 044's "never gate [fastSend]" true on the way out as well as the way in.
+     */
+    private fun staleReason(frame: OutboundFrame): StaleAtSend? {
+        val gate = frame.gate
+        // Links, never sightings — the same reading as [coveredByLink], and for the same field reason.
+        if (gate.recipientId != null && (gate.recipientId == selfIdCached || gate.recipientId in linkedPeers)) {
+            return StaleAtSend.LINKED
+        }
+        if (gate.recipientId != null && gate.recipientId in internetPeers) return StaleAtSend.INTERNET
+        // Only of a frame that passed the reach gate: the probe flew because its recipient was unheard.
+        if (gate.reachGated && gate.recipientId != null && !heard(gate.recipientId)) return StaleAtSend.UNHEARD
+        if (gate.freshUntil != null && wallClock() > gate.freshUntil) return StaleAtSend.STALE
+        if (gate.roleGated && role != LoraGatewayPolicy.Role.ACTIVE) return StaleAtSend.PASSIVE
+        return null
+    }
+
+    /** A publisher key as it reads in the log: the unsigned hex of the 64-bit hash an OFFER carries. */
+    private fun keyOf(publisher: Long): String = publisher.toULong().toString(HEX)
+
+    /** Whether we may put anything on the air at all. A passive gateway listens and relays, but never transmits. */
+    private fun mayTransmit(): Boolean {
+        // No board bound, or the plane switched off — the state most installs are in, since the child joins the
+        // composite on `BuildConfig.LORA_PLANE` alone while the setting defaults off. Asked here rather than in
+        // each caller so a new transmit path cannot forget it: before this, [fanout] alone was unguarded and
+        // every eligible broadcast frame still paid for the ADR 060 transcode and the ADR 2026-09.mhs5 pad
+        // pricing, then sat in a queue the pacer can never drain (it takes only while the link is Ready) until
+        // the cap shed it — a lab Pixel that has never been near a board logged `lora pad fanout:chat +42B past
+        // the signature cliff`. Deliberately uncounted, unlike the passive case below: `loraSuppressed` means
+        // this plane could have carried the frame and declined, and an unconfigured plane would tick it on
+        // every frame, on most devices, forever.
+        if (currentConfig == null) return false
+        if (role == LoraGatewayPolicy.Role.ACTIVE) return true
+        metrics.onLoraPassive()
+        return false
+    }
+
+    /**
+     * Puts this phone's user's post on the board's primary channel — [PublicChannelSink], the Meshtastic
+     * room's outbound half. Called by [app.getknit.knit.mesh.MeshManager.sendPublicPost] for a post typed on
+     * this phone and no other: the room posts through its own board, never through a pocket-mate's, so the
+     * ADR 044 election plays no part here and a refusal is something the composer shows the user.
+     *
+     * The guards are all here rather than at the write, so each one can be counted and named. They are
+     * deliberately **not** [boundSlotIsKnit]'s: that guard exists to keep Knit's cleartext frames off the
+     * public channel by accident and reads an unknown channel table as "stay silent", while this is a
+     * consented path *to* that channel. Same shape, opposite safe answer, so sharing code between them would
+     * make one of the two wrong.
+     */
+    override suspend fun postToPublicChannel(body: String): PublicPostRefusal? {
+        // The composer is gone with the room's row, so this is the net under a route that no longer draws one
+        // (the debug SEND intent, a screen still on the back stack) — the same net `MeshManager.sendTyping`
+        // keeps under the room it must not cue.
+        if (currentConfig?.room == false) return refusePublicPost(PublicPostRefusal.ROOM_OFF)
+        // A board on a dedicated RF slot (ADR 067) has no public channel under it: a post would go on the
+        // air where only other pinned Knit boards could hear it, into a room this phone no longer draws.
+        if (pace.airtime.dedicated()) return refusePublicPost(PublicPostRefusal.DEDICATED)
+        val ready = link.state.value as? LinkState.Ready ?: return refusePublicPost(PublicPostRefusal.NOT_READY)
+        // A board whose slot 0 is the Knit channel has no primary to post on — the debug-bridge shape the
+        // receive half refuses to read for the same reason, decided off the same table.
+        if (PublicChannelPolicy.isKnitPrimary(ready.channels)) return refusePublicPost(PublicPostRefusal.KNIT_ON_PRIMARY)
+        val now = clock()
+        val last = lastPublicPostAt.get()
+        if (last != NEVER && now - last < PUBLIC_POST_FLOOR_MS) return refusePublicPost(PublicPostRefusal.TOO_SOON)
+        // The same budget the composer applied — a draft typed while the facts still said 200 (a board that
+        // came up signing after the draft began) is trimmed here rather than sent past the cliff unsigned.
+        val message = PublicPostPolicy.onAirText(body, PublicPostPolicy.onAirBudget(pace.airtime.signing)).encodeToByteArray()
+        if (message.size > maxPayload) return refusePublicPost(PublicPostRefusal.TOO_LARGE)
+        // Asked before queueing rather than left to the pacer: a post the budget will not carry should be
+        // counted as refused now, not sit in the queue looking sent until the window rolls over.
+        // Priced at the text port's own cliff: a post at the 166-byte cap is signed air, not an unsigned packet.
+        if (!pace.airtime.admits(
+                AirBucket.PUBLIC,
+                FrameClass.ROOM,
+                listOf(message.size),
+                now,
+                signedUpTo = MeshtasticProto.maxSignedPayload(MeshtasticProto.PORT_TEXT_MESSAGE),
+            )
+        ) {
+            return refusePublicPost(PublicPostRefusal.NO_AIR)
+        }
+        // Claimed at enqueue, not at write: the floor is about how often this phone *decides* to speak, and
+        // charging it only once the pacer drains would let a burst queue up behind one 3 s gap.
+        lastPublicPostAt.set(now)
+        enqueue(listOf(message), "public", FrameClass.ROOM, AirBucket.PUBLIC, Destination.Public)
+        return null
+    }
+
+    private fun refusePublicPost(reason: PublicPostRefusal): PublicPostRefusal {
+        metrics.onPublicPostRefused(reason.name)
+        log("lora public post refused: $reason")
+        return reason
+    }
+
+    /**
+     * Publishes a [LoraCtl] OFFER on the gossip policy's schedule. One packet says what we hold, so a far
+     * gateway can serve exactly what we lack — no request round trip, and no blind re-transmission of history
+     * the other pocket already has.
+     */
+    private suspend fun gossipLoop() {
+        // Before the first `nextDueAt`, or the interval this computes a wait from is a fresh one at the floor
+        // rather than the back-off the last process had earned.
+        awaitRestored()
+        while (scope.isActive) {
+            // Nothing to offer without a board, and the interval bookkeeping would only be thrown away when
+            // one arrives — [LoraGossipPolicy.ensureInterval] starts a fresh interval at that moment anyway.
+            awaitConfigured()
+            val wait = (gossip.nextDueAt(clock()) - clock()).coerceAtLeast(0)
+            // The slot is consumed before the link is consulted, and that ordering is load-bearing: skipping
+            // the take while the board is down leaves the transmit point in the past, so the next pass
+            // computes a zero wait and the loop spins at full tilt until the board returns.
+            if (wait > 0) withTimeoutOrNull(wait) { gossipWake.receive() } else delay(IDLE_TICK_MS)
+            if (!gossip.takeTransmitSlot(clock())) continue
+            if (link.state.value is LinkState.Ready) publishOffer()
+        }
+    }
+
+    private suspend fun publishOffer() {
+        if (currentConfig?.bridge != true || !mayTransmit()) return
+        val self = selfIdCached ?: return
+        val prefixes = runCatching { offerPrefixes(LoraCtl.MAX_PREFIXES) }.getOrDefault(IntArray(0))
+        val payload = LoraCtl.encodeOffer(StoreDigest.hash64(self), prefixes, maxPayload)
+        lastOfferPrefixes = LoraCtl.decodeOffer(payload)?.prefixes ?: IntArray(0)
+        // An OFFER is a snapshot ([OutboundFrame.supersedes]): one still queued from a previous interval
+        // names a set we have since changed, so a far gateway would compute its backfill against a lie — and
+        // one queued at a time is what keeps the Trickle timer the real bound on this class.
+        enqueue(
+            listOf(payload),
+            "offer:${lastOfferPrefixes.size}",
+            FrameClass.GOSSIP,
+            // Its own bucket, not BRIDGE: the offer is exempt from the bridge share, and booking an exempt
+            // packet against that share spends serving's budget on something serving cannot decline to send
+            // (ADR 2026-09.7c8n). The window total still bounds it.
+            AirBucket.GOSSIP,
+            supersedes = OFFER_KEY,
+            gate = RideGate(roleGated = true),
+        )
+    }
+
+    /**
+     * A gateway's OFFER. Three things follow from one packet: it proves the publisher has a board (so the
+     * election has a rival to weigh), it tells the gossip timer whether our own OFFER would be redundant,
+     * and — if the publisher is in another pocket — it says exactly what to send them.
+     */
+    private fun onCtlPacket(packet: ReceivedPacket) {
+        val offer = LoraCtl.decodeOffer(packet.payload) ?: return
+        val self = selfIdCached
+        if (self != null && offer.publisher == StoreDigest.hash64(self)) return // our own, echoed by the mesh
+        val now = clock()
+        val key = keyOf(offer.publisher)
+        metrics.onLoraOfferReceived()
+        gateway.onOffer(offer.publisher, now)
+        if (packet.from != 0u) {
+            boardOwners[packet.from] = OfferedBy(offer.publisher, now)
+            // A radio we just learned is a co-pocket gateway's withdraws the hearings it already put in `reachable`.
+            recomputeReachable(now)
+        }
+        val sameSet = offer.prefixes.contentEquals(lastOfferPrefixes)
+        gossip.onOffer(sameSet = sameSet, now = now)
+        // Logged before any of the decisions below, because "did the other gateway's offer reach this phone
+        // at all" is the question a field trial cannot answer afterwards — an offer that was heard and
+        // declined and one that was lost to the air both leave no trace otherwise (ADR 2026-09.zkma).
+        log("lora rx offer:${offer.prefixes.size} from $key same=$sameSet")
+        // An offer announcing a set that is not ours may have snapped the timer to its floor, and the gossip
+        // loop is asleep on a wait computed from the *old*, longer due time. Without the poke it would sleep
+        // through the acceleration and wake past the reset interval's end — doubling instead of snapping.
+        // A spurious wake costs nothing: the loop re-reads nextDueAt, declines the slot, and sleeps again.
+        if (!sameSet) gossipWake.trySend(Unit)
+        recomputeRole()
+        // Note an OFFER does NOT mark its publisher `reachable`: the packet carries a hash, not a node id,
+        // so there is no Peer to record. The first actual frame from that node does it, which is the right
+        // moment anyway — a gateway is a relay, not necessarily someone you can address.
+        //
+        // A co-pocket gateway is not a bridge peer: custody syncs to it for real over BLE/NAN, so serving it
+        // over LoRa would spend air on frames already crossing a link that costs nothing.
+        if (!gateway.isFarGateway(offer.publisher, pocketKeys())) {
+            log("lora bridge skipped $key: co-pocket gateway")
+            return
+        }
+        scope.launch { serveBackfill(offer) }
+    }
+
+    /**
+     * Serves a far gateway the frames its OFFER shows it is missing. Bounded three ways, deliberately: the
+     * per-publisher hourly cap below, the per-sighting [BACKFILL_LIMIT], and — the one that actually
+     * matters — the BRIDGE airtime budget in [LoraAirtime]. Without the first, a node that re-offers an
+     * empty set could walk us through our whole custody set on the air; without the last, a busy bridge
+     * would crowd out live chat. The sig dedup is deliberately **not** a fourth: see [serveOne]. What it
+     * cost us was the repair, what it saved is at most a duplicate frame the receiver's SeenSet drops.
+     *
+     * The budget is asked **before** each frame is queued, and a frame it refuses is skipped rather than
+     * ending the round (ADR 2026-09.7c8n: the rank puts the priciest candidate first, so stopping there let
+     * one unaffordable frame silence a whole round). It used to be consulted only by the pacer, after the
+     * hourly allowance had been booked and `loraBridged` counted — so a bridge whose window was spent kept
+     * enqueueing frames that sat until class shedding evicted them, and both the cap and the counter
+     * described air nobody ever heard (2026-09-04: `loraBridged` at the full 12, `loraDroppedQueue` 23,
+     * nothing landing). The check reads **recorded** air, not what is
+     * already queued and unspent, so one round's frames still all pass; what it stops is the next round, and
+     * the rounds after that, which is where the pile came from.
+     */
+    private suspend fun serveBackfill(offer: LoraCtl.Offer) {
+        val key = keyOf(offer.publisher)
+        // One reason per line rather than one guard: a round that serves nothing says so at the end, and the
+        // three ways it can decline to start had no trace at all until a field trial needed to tell them
+        // apart from an offer that never arrived (ADR 2026-09.zkma).
+        if (currentConfig?.bridge != true) {
+            log("lora bridge skipped $key: the bridge switch is off")
+            return
+        }
+        if (!mayTransmit()) {
+            log("lora bridge skipped $key: passive gateway")
+            return
+        }
+        val now = clock()
+        val budget = servedTo.getOrPut(offer.publisher) { ServeBudget() }
+        val allowance = budget.take(BACKFILL_LIMIT, now)
+        stateWake.trySend(Unit)
+        if (allowance == 0) {
+            metrics.onLoraBridgeRefused()
+            log("lora bridge refused $key: hourly serve cap spent")
+            return
+        }
+        val dms = currentConfig?.dms == true
+        val candidates = runCatching { framesMissing(offer.prefixes, allowance * CANDIDATE_SLACK, dms) }.getOrDefault(emptyList())
+        // The far side may never have seen our key, and a frame it cannot verify is airtime thrown away — but
+        // beacon only when we are actually about to send it something. An offer arrives every few minutes from
+        // every gateway in range; beaconing on each one would spend more air on profiles than on messages.
+        if (candidates.isNotEmpty()) beaconProfile(FIRST_HEARING_GAP_MS)
+        var served = 0
+        var unaffordable = 0
+        for (wire in candidates) {
+            if (served >= allowance) break
+            when (serveOne(wire)) {
+                Serve.SENT -> served++
+
+                Serve.SKIPPED -> Unit
+
+                // Skipped, not the end of the round. [LoraFramePolicy.backfillRank] deliberately puts the
+                // *most expensive* candidate first — a profile, then a room post — so ending here handed the
+                // whole round to whichever frame happened not to fit, and a one-packet DM behind it went
+                // unsent against air that would have carried it. Nothing is queued by a refusal, so there is
+                // no pile to shed either; [LoraPacePolicy.admitBest] has always skipped for the same reason.
+                // ADR 2026-09.7c8n.
+                Serve.NO_AIR -> unaffordable++
+            }
+        }
+        budget.refund(allowance - served)
+        if (served > 0) {
+            metrics.onLoraBridged(served)
+            // Something crossed, so the far side's picture just changed: gossip again soon rather than at the
+            // backed-off interval, and let the next OFFER carry what is still missing.
+            gossip.reset(clock())
+            gossipWake.trySend(Unit)
+        }
+        // The reason, not just the count: `served=0/4` alone cannot tell an offer that named everything we
+        // hold from a window with no air left, and those want opposite remedies (ADR 2026-09.7c8n).
+        val why = if (unaffordable > 0) " ($unaffordable over budget)" else ""
+        log("lora bridge served=$served/$allowance to $key$why")
+    }
+
+    /** What one backfill candidate did: went out, was passed over, or cost more air than the window has. */
+    private enum class Serve { SENT, SKIPPED, NO_AIR }
+
+    /**
+     * Enqueues one backfilled frame. [Serve.SKIPPED] when it can't ride (too big, or a link already covers
+     * it); [Serve.NO_AIR] when the bridge window cannot carry *this* frame — the caller tries the next one,
+     * since a cheaper candidate may still fit what is left.
+     *
+     * Deliberately gated by **neither** dedup set. This is the digest-driven repair path: the offer is
+     * positive evidence that the far gateway lacks this exact frame, which outranks either set's guess that
+     * we need not send it. [profileSeen] was exempted first (ADR 057) because the fan-out stops re-offering
+     * a publish and a far pocket cannot ask for one — this plane refuses `keyreq`. [sigSeen] is exempt for
+     * the same reason (ADR 2026-09.y8pu): it records that we *transmitted*, and on a plane with no acks that
+     * is not evidence anyone *heard* — a fan-out into an empty sky spends the slot exactly as a heard one
+     * does, and for the ten minutes after it the repair path skipped the frame it was there to repair.
+     * Still **recorded**, so a live fan-out inside the window doesn't duplicate what the bridge just queued.
+     * `LoraFramePolicy.backfillRank` already serves profiles first.
+     */
+    private fun serveOne(wire: WireEnvelope): Serve {
+        val env = WireCodec.decodeEnvelope(wire.signed) ?: return Serve.SKIPPED
+        if (skipCovered(env)) return Serve.SKIPPED // the far pocket would only ever carry a frame its addressee already holds
+        // A copy already waits — the probe, a re-offer on LIVE: queueing ours would supersede it onto BRIDGE, a share
+        // that may be spent, when it is going anyway (ADR 2026-10.a4pm).
+        supersedeKeyFor(env)?.takeIf { LoraFramePolicy.isDmForm(env) }?.let { if (pace.hasQueued(it)) return Serve.SKIPPED }
+        val label = "bridge:${env.id}"
+        val parts = encodeOrNull(wire, label) ?: return Serve.SKIPPED
+        // Its natural class, so a room post still cannot evict a DM in the queue, but the BRIDGE bucket, so
+        // every byte of it is metered as the backfill it is.
+        val klass = classOf(env, FanoutHint.CONTENT)
+        // Asked before the dedup slot is spent, for the reason [encodeOrNull] gives about the sig window: a
+        // frame that never goes out must leave nothing behind that suppresses a later attempt at it.
+        //
+        // Against what is already **queued** for BRIDGE as well as what is already recorded (ADR
+        // 2026-09.zkma). The ledger only books a frame when it leaves, so a whole round used to pass
+        // admission and then run out of window half-way down the queue — and the frame left behind was
+        // always the room post, because [FrameClass] drains a DM before the room while
+        // [LoraFramePolicy.backfillRank] spends the round's scarce slots the other way round, so asking per
+        // candidate is what lets the round pay for the ones it can and skip the ones it cannot.
+        val now = clock()
+        val queued = pace.pendingSizes(AirBucket.BRIDGE)
+        val outstanding = queued + parts.map { it.size }
+        if (!pace.airtime.admits(AirBucket.BRIDGE, klass, outstanding, now)) {
+            // The same counter a frame the pacer holds ticks, because it is the same fact: this one waits for
+            // a later window and the next offer will name it again. Refusing here instead of in the queue is
+            // what keeps the serve cap honest, but it must not make the refusal invisible on the way.
+            metrics.onLoraAirtimeHeld(AirBucket.BRIDGE.name)
+            // Named, priced, and against the ledger it was priced by — the three things a field trial cannot
+            // reconstruct afterwards (ADR 2026-09.7c8n). `loraBridgeRefused` counts only the hourly serve cap
+            // and read 0 all session, so the aggregate `served=0/N` line could say a round paid for nothing
+            // but never which frame, nor whether the window was spent or merely already promised. The
+            // `+ Nms queued` half is the ADR 2026-09.zkma distinction: air this round has committed and the
+            // ledger has not yet booked.
+            val ownMs = parts.sumOf { pace.airtime.timeOnAirMs(it.size) }
+            val queuedMs = queued.sumOf { pace.airtime.timeOnAirMs(it) }
+            log(
+                "lora bridge held $label: ${ownMs}ms + ${queuedMs}ms queued, " +
+                    "BRIDGE ${pace.airtime.usedMs(AirBucket.BRIDGE, now)}/${pace.airtime.budgetMs(AirBucket.BRIDGE)}",
+            )
+            return Serve.NO_AIR
+        }
+        sigSeen.add(dedupKey(wire, env)) // recorded for the fan-out's benefit, never consulted here — see the kdoc
+        // No freshness: backfill is history by definition, and [isFresh] was never asked of it.
+        val admitted =
+            enqueue(
+                parts,
+                label,
+                klass,
+                AirBucket.BRIDGE,
+                // The re-offer's handle on this copy while it waits (ADR 2026-10.a4pm), and the slot to hand back
+                // if it is refused at send.
+                supersedes = supersedeKeyFor(env),
+                gate =
+                    RideGate(
+                        recipientId = env.recipientId?.takeIf { LoraFramePolicy.isDmForm(env) },
+                        roleGated = true,
+                    ),
+                sigKey = dedupKey(wire, env),
+            )
+        // A refused serve was handed back by the pacer ([abandon] reopened its slot) and spent nothing of the round.
+        return if (admitted) Serve.SENT else Serve.SKIPPED
+    }
+
+    /** Whether [minGapMs] has elapsed since the last self-profile; overflow-safe against the [NEVER] sentinel. */
+    private fun profileGapElapsed(
+        now: Long,
+        minGapMs: Long,
+    ): Boolean = lastSelfProfileAt.get().let { it == NEVER || now - it >= minGapMs }
+
+    // --- the pacer ---
+
+    private suspend fun pacerLoop() {
+        // Nothing may be taken off the queue until the ledger says what the last process spent: this is the
+        // one place all outbound air passes through, so it is the one that has to wait.
+        awaitRestored()
+        // ...nor until we know who we are. [selfId] resolves on a coroutine of its own, and until it has, the
+        // enqueuing gates read every DM-form frame addressed to us as uncovered: a DM a pocket-mate handed us
+        // over the link, re-fanned on relay, was queued for the air. [staleReason] asks the same question again
+        // on the way out, so waiting here is what lets it answer with the id it was missing (#141: the lab's
+        // linked-DM gate, under a chaos stall of that one launch, aired a DM and a ✓✓ addressed to itself).
+        selfIdKnown.first { it != null }
+        // The id is published before [resolveSelfId] gets to recompute the role from it, and an OFFER heard
+        // while it was null recomputed nothing: settle the role here, or the first take reads the default ACTIVE.
+        recomputeRole()
+        while (scope.isActive) {
+            // Nothing leaves while the board is between sessions, so take nothing: a frame off the queue has
+            // no owner but the pacer, and every take during an outage is one more round-trip through
+            // [requeue]. Park on the link itself rather than [waitForNextSend]: with a frame queued its idle
+            // tick fired every second for the whole outage (#67), and an absent board can be away for days.
+            // Reading the state flow cannot miss the session-up the way a wake could.
+            if (link.state.value !is LinkState.Ready) {
+                link.state.first { it is LinkState.Ready }
+                continue
+            }
+            val frame =
+                pace.take(clock()).also {
+                    // Reported after every take, admitted or not: one bucket can be spent while another still
+                    // flows, and it is the *held* frame that has to be visible — nothing else counts it until
+                    // the queue fills and sheds it as an ordinary drop. Only after a real take because
+                    // [LoraPacePolicy.lastAirtimeHolds] clears on entry to `take` and nowhere else: reading it
+                    // on a wake that took nothing re-reports the previous wake's holds.
+                    pace.lastAirtimeHolds.forEach { hold -> metrics.onLoraAirtimeHeld(hold.name) }
+                }
+            if (frame == null) {
+                waitForNextSend()
+            } else {
+                try {
+                    sendFrame(frame)
+                } finally {
+                    pace.done(frame)
+                }
+            }
+        }
+    }
+
+    /**
+     * Parks the pacer until the queue could plausibly move: a wake (something enqueued, the board's queue
+     * freed, [heal]), or the pacer's own due time. Only reached with the link Ready — [pacerLoop] parks on
+     * the link state during an outage.
+     *
+     * The floor is load-bearing, exactly as it is in [gossipLoop]. A queue can be non-empty while nothing may
+     * leave it — the board reports no headroom, or the hour's airtime is spent — and [LoraPacePolicy.take]
+     * says only "not now", not "not until". A due time already in the past then yields a zero wait, and
+     * `withTimeoutOrNull(0)` returns without suspending: the loop spins a core flat until the condition
+     * clears, and with no suspension point in it, [stop] cannot even cancel it.
+     */
+    private suspend fun waitForNextSend() {
+        if (pace.pending == 0) {
+            wake.receive()
+        } else {
+            val due = pace.nextDueAt() - clock()
+            withTimeoutOrNull(if (due > 0) due else IDLE_TICK_MS) { wake.receive() }
+        }
+    }
+
+    private suspend fun sendFrame(frame: OutboundFrame) {
+        // Two destinations, two guards, and deliberately no shared code between them (§5 of work item #37):
+        // `boundSlotIsKnit` stops Knit's own frames reaching the public channel by accident, while the public
+        // post's guards were all applied at `postToPublicChannel`, where a refusal could still be counted and
+        // reported. All that is left here is which channel and which portnum.
+        if (frame.destination != Destination.Knit) {
+            sendPublicFrame(frame)
+            return
+        }
+        // The board went away between the take and here — a GATT drop, or the reconnect backoff still running.
+        // The frame is owed either way, so it goes back on the queue: nothing else holds a copy, and the
+        // pacer would otherwise eat one every `minGapMs` for the whole outage. Field-observed on a board whose
+        // link flapped five times in twenty minutes: a 93-second backoff destroyed six queued frames, and the
+        // log blamed the channel setup because this read a missing link as the wrong slot.
+        val ready = link.state.value as? LinkState.Ready
+        if (ready == null) {
+            requeue(frame)
+            return
+        }
+        // Asked only of a frame that has not yet put a fragment on the air: [OutboundFrame.remaining] exists
+        // to finish a part-sent frame, and abandoning one would strand the fragments the board already holds.
+        if (frame.sentParts == 0) {
+            staleReason(frame)?.let { reason ->
+                metrics.onLoraStaleAtSend(reason.name)
+                log("lora stale at send ${frame.label}: ${reason.name.lowercase()}")
+                abandon(frame)
+                return
+            }
+        }
+        val ch = currentConfig?.channelIndex
+        if (ch == null) {
+            abandon(frame)
+            return
+        }
+        if (!boundSlotIsKnit(ready.channels, ch)) {
+            metrics.onLoraSuppressed()
+            log("lora send skipped: slot $ch is not the Knit channel — set this board up")
+            abandon(frame)
+            return
+        }
+        // Resume where the board left off. A frame refused part-way is requeued whole, and re-sending the
+        // fragments it already holds would both duplicate them on the air and book their airtime again — the
+        // ledger only grows on a retry, so that inflates the hourly budget until it refuses the whole plane.
+        for (message in frame.remaining) {
+            if (!sendMessage(message, ch, frame)) return
+        }
+        metrics.onLoraSent()
+        if (frame.fragmented) metrics.onLoraFragSent()
+        if (frame.klass == FrameClass.DM || frame.klass == FrameClass.TICK) metrics.onLoraDmSent() // both DM-form
+        // Counted here rather than at enqueue: an offer refused by the budget or superseded in the queue is
+        // one the far pocket never heard, and this counter's whole job is to say whether it did.
+        if (frame.klass == FrameClass.GOSSIP) metrics.onLoraOfferSent()
+        log("lora tx ${frame.label} parts=${frame.messages.size}")
+    }
+
+    /**
+     * Writes one public post on the foreign mesh's primary channel: index 0, `TEXT_MESSAGE_APP`, cleartext —
+     * or, for a [Destination.Reply], the same write addressed to one node, which the firmware then encrypts
+     * to that node's key rather than to the channel.
+     *
+     * Never fragmented — [PublicPostPolicy.MAX_ON_AIR_BYTES] is a fifth of what one packet carries — so there
+     * is no resume cursor to honour and one `sendMessage` is the whole frame.
+     */
+    private suspend fun sendPublicFrame(frame: OutboundFrame) {
+        val message = frame.messages.firstOrNull() ?: return
+        val reply = frame.destination == Destination.Reply
+        if (!sendMessage(message, PublicChannelPolicy.PRIMARY_INDEX, frame, MeshtasticProto.PORT_TEXT_MESSAGE, to = frame.to)) {
+            if (reply) metrics.onAutoReplyRefused(AutoReplyRefusal.NAK.name) else metrics.onPublicPostRefused(PublicPostRefusal.NAK.name)
+            return
+        }
+        if (reply) {
+            metrics.onAutoReplySent()
+            log("lora tx auto-reply to ${meshNodeLabel(frame.to.toLong())} ${message.size}B")
+        } else {
+            metrics.onPublicPostSent()
+            log("lora tx public ${message.size}B")
+        }
+    }
+
+    /** Sends one fragment; false ends the frame (a NAK, error, or no headroom). */
+    private suspend fun sendMessage(
+        message: ByteArray,
+        channelIndex: Int,
+        frame: OutboundFrame,
+        portnum: Int = MeshtasticProto.PORT_PRIVATE_APP,
+        to: UInt = MeshtasticProto.BROADCAST,
+    ): Boolean =
+        when (val result = link.send(message, channelIndex, portnum = portnum, hopLimit = HOP_LIMIT, to = to)) {
+            is SendResult.Queued -> {
+                pace.onQueueStatus(result.queue.free)
+                pace.airtime.record(frame.bucket, message.size, clock(), signedUpTo = MeshtasticProto.maxSignedPayload(portnum))
+                stateWake.trySend(Unit)
+                frame.onPartSent()
+                // The ledger just moved, and a send is the only thing that spends it — so republish here
+                // rather than leave the chat's saturation notice and the radio screen's percentage waiting
+                // on the 60 s linger sweep. Cheap: the pacer's 3 s floor bounds how often this can run, and
+                // `LoraStatusRepository` reduces the snapshot to a threshold before any UI sees it.
+                publishStatus()
+                true
+            }
+
+            is SendResult.Nak -> {
+                metrics.onLoraNak(result.reason.name)
+                log("lora nak id=${result.id} reason=${result.reason} label=${frame.label}")
+                pace.onNak(result.reason, clock())
+                abandon(frame) // a no-op once a fragment has flown
+                false
+            }
+
+            SendResult.Busy -> {
+                requeue(frame)
+                false
+            }
+
+            else -> {
+                log("lora tx ${frame.label} gave up: $result")
+                abandon(frame)
+                false
+            }
+        }
+
+    private fun requeue(frame: OutboundFrame) {
+        // Put back, never re-admitted: a requeue runs no supersede, or an older profile put back here would delete
+        // the newer one queued while it was out (ADR 2026-09.xdm2).
+        if (pace.requeue(frame) != LoraPacePolicy.Admission.ACCEPTED) metrics.onLoraDroppedQueue()
+        abandonShed()
+    }
+
+    /**
+     * Hands back what a frame that never flew was holding (ADR 2026-10.a4pm): its dedup slot, which records a
+     * transmission that did not happen and would turn the next re-offer or backfill away; a probe's window,
+     * since a probe that never flew told nobody anything; a re-offer's hour. A no-op once a fragment has gone —
+     * that frame did fly, in part. `SeenSet.reopen` gives one more copy per id per window, so a frame abandoned
+     * twice inside ten minutes keeps its slot the second time. Called from every path that drops an unsent frame:
+     * the send-time re-ask, a NAK or give-up on the first fragment, a missing config or a slot that is not Knit's,
+     * and the pacer's shed and oversize evictions ([abandonShed]).
+     */
+    private fun abandon(frame: OutboundFrame) {
+        if (frame.sentParts > 0) return
+        frame.sigKey?.let(sigSeen::reopen)
+        frame.probe?.let(dmProbeAt::release)
+        frame.reofferId?.let(reofferedAt::reopen)
+    }
+
+    /** [abandon]s whatever the pacer dropped unsent since the last look. */
+    private fun abandonShed() {
+        pace.drainShed().forEach(::abandon)
+    }
+
+    private fun onNak(outcome: PacketOutcome) {
+        metrics.onLoraNak(outcome.reason.name)
+        log("lora nak id=${outcome.id} reason=${outcome.reason} (late)")
+        pace.onNak(outcome.reason, clock())
+    }
+
+    // --- inbound ---
+
+    private fun onLoraPacket(packet: ReceivedPacket) {
+        if (packet.payload.isEmpty()) return
+        val bound = currentConfig?.channelIndex
+        // Slot 0 is the Meshtastic room's channel, mirrored as the user configured it. The room reads only
+        // chat, so only `TEXT_MESSAGE_APP` turns off here; everything else on the slot falls through to the
+        // Knit path, which keeps its own portnum filter. Decided off the portnum rather than off the bound
+        // index, because the index defaults to 0 on a board that never ran Knit's setup and such a board
+        // still has a primary to mirror — the one shape with nothing to mirror (Knit itself at slot 0, the
+        // debug bridge's lab binding) is refused inside, off the channel table.
+        // A text addressed to the board rather than to the channel is a Meshtastic user's DM — which nothing
+        // on this phone reads (ADR 2026-09.emd7 marks the board unmonitored to say exactly that), so the one
+        // thing to do with it is tell the sender. Taken ahead of the room's branch on the portnum and the
+        // address alone, never the channel index: on 2.5+ firmware a DM is PKI-encrypted and reported on
+        // index 0 whatever slot the sender used, and an older board reports the slot it decoded on.
+        if (packet.portnum == MeshtasticProto.PORT_TEXT_MESSAGE && packet.to != MeshtasticProto.BROADCAST) {
+            onDirectMessage(packet)
+            return
+        }
+        if (packet.channelIndex == PublicChannelPolicy.PRIMARY_INDEX && packet.portnum == MeshtasticProto.PORT_TEXT_MESSAGE) {
+            // The room is switched off, or hidden because the board is on a dedicated RF slot (ADR 067):
+            // this packet has nowhere to go. Dropped here rather than later so the whole cost of a post the
+            // user asked not to see — the judge, the signature verify, the contact lookup, the moderator, the
+            // row and its notification — is never paid. Counted by reason, so `…debug.LORA` can still tell
+            // "the channel is quiet" from "the channel is busy and Knit is ignoring it".
+            val closed =
+                when {
+                    currentConfig?.room == false -> MESH_POST_ROOM_OFF
+
+                    // A post on a pinned board's slot 0 is another pinned board's, never a public one, and
+                    // would land in a thread with no row and ring a notification for it.
+                    pace.airtime.dedicated() -> MESH_POST_DEDICATED
+
+                    else -> null
+                }
+            if (closed != null) metrics.onMeshPostRefused(closed) else onPrimaryPacket(packet)
+            return
+        }
+        if (packet.portnum != MeshtasticProto.PORT_PRIVATE_APP) return
+        // Outbound is pinned to the bound channel; inbound was not, so a board carrying a second channel with
+        // Knit traffic on it used to ingest both. Ignore anything off the channel this plane is bound to.
+        if (bound != null && packet.channelIndex != bound) return
+        noteBoard(packet)
+        if (LoraCtl.isCtl(packet.payload)) onCtlPacket(packet) else onFramePacket(packet)
+    }
+
+    /**
+     * One chat packet off the board's **primary** channel — what the Meshtastic room mirrors. [PublicChannelPolicy]
+     * decides whether it is a post; a refusal is counted and dropped, and an accepted post is delivered into
+     * this phone's room and nowhere else. Every board reads its own slot 0: there is no election and no
+     * minting, because nothing about a heard post leaves the phone.
+     *
+     * One rule that is easy to get wrong here: **[noteBoard] is not called.** `boardsHeard` means "radios
+     * that have sent a *Knit* frame", which is what makes "heard nobody" the ordinary state of a solo user
+     * and is why the preset-mismatch notice cannot be gated on evidence. Counting stock neighbours here would
+     * quietly change all of that.
+     */
+    private fun onPrimaryPacket(packet: ReceivedPacket) {
+        metrics.onMeshPostHeard()
+        val ready = link.state.value as? LinkState.Ready ?: return
+        val verdict =
+            PublicChannelPolicy.judge(
+                packet = packet,
+                channels = ready.channels,
+                radio = ready.radio,
+                name = link.nodes.value[packet.from]?.longName,
+                // Our own board's transmissions are never read back in: the outbound half puts this phone's
+                // posts on this channel, and they are already in the room as our own rows.
+                ownNode = ready.board.myNodeNum,
+            )
+        when (verdict) {
+            is PublicChannelPolicy.Verdict.Refused -> {
+                metrics.onMeshPostRefused(verdict.reason.name)
+            }
+
+            is PublicChannelPolicy.Verdict.Post -> {
+                metrics.onMeshPostIngested(verdict.post.viaMqtt)
+                log(
+                    "lora public post from ${meshNodeLabel(packet.from.toLong())} " +
+                        "${verdict.post.body.length}ch viaMqtt=${verdict.post.viaMqtt} " +
+                        "signed=${verdict.post.signature != null} boardVerified=${verdict.post.boardVerified}",
+                )
+                scope.launch { onPublicPost(verdict.post) }
+            }
+        }
+    }
+
+    /**
+     * One text addressed to the board — a Meshtastic user's DM, answered once with [DmAutoReplyPolicy.TEXT].
+     *
+     * The guards are all here rather than at the write, so each one can be counted and named, the same shape
+     * as [postToPublicChannel] and for the same reason. Two are the room's own: a board on a **dedicated**
+     * RF slot (ADR 067) has no Meshtastic neighbours to answer, and a board whose slot 0 is the Knit channel
+     * has no primary to answer on. One is this path's alone: the board must be **set up for Knit**
+     * ([boundSlotIsKnit]), because the setup's confirmation sheet is where the user agreed to the board
+     * saying it is unmonitored (ADR 2026-09.emd7) — a paired stock board that never ran it stays as quiet
+     * as a stock board. Then the policy's own caps, and last the room's airtime share, asked before queueing
+     * so a reply the window will not carry is counted now rather than left to look sent.
+     *
+     * The reply rides the shared pacer as a [Destination.Reply] frame and is priced as a signed post: a
+     * unicast is PKI-encrypted rather than signed, whose overhead is smaller, so the ledger over-charges it
+     * by a few dozen bytes — the conservative error, and not worth a second price.
+     */
+    private fun onDirectMessage(packet: ReceivedPacket) {
+        metrics.onAutoReplyHeard()
+        val refusal = autoReplyRefusal(packet) ?: return
+        metrics.onAutoReplyRefused(refusal)
+        log("lora dm from ${meshNodeLabel(packet.from.toLong())}: auto-reply refused $refusal")
+    }
+
+    /** The gate that stopped the reply to [packet], by name — or null once the reply is queued. */
+    private fun autoReplyRefusal(packet: ReceivedPacket): String? {
+        val ready = link.state.value as? LinkState.Ready ?: return AutoReplyRefusal.NOT_READY.name
+        if (pace.airtime.dedicated()) return AutoReplyRefusal.DEDICATED.name
+        if (PublicChannelPolicy.isKnitPrimary(ready.channels)) return AutoReplyRefusal.KNIT_ON_PRIMARY.name
+        // `boundSlotIsKnit` reads an empty table as "don't suppress"; this is a consented transmission, so the
+        // unknown reads the other way, like the setup's own guard.
+        val bound = currentConfig?.channelIndex
+        if (bound == null || ready.channels.isEmpty() || !boundSlotIsKnit(ready.channels, bound)) return AutoReplyRefusal.NOT_SET_UP.name
+        val reply =
+            when (val verdict = autoReply.judge(packet, ownNode = ready.board.myNodeNum)) {
+                is DmAutoReplyPolicy.Verdict.Refused -> return verdict.reason.name
+                is DmAutoReplyPolicy.Verdict.Reply -> verdict
+            }
+        val message = reply.text.encodeToByteArray()
+        val signedUpTo = MeshtasticProto.maxSignedPayload(MeshtasticProto.PORT_TEXT_MESSAGE)
+        val held =
+            when {
+                message.size > maxPayload -> {
+                    AutoReplyRefusal.TOO_LARGE
+                }
+
+                !pace.airtime.admits(AirBucket.PUBLIC, FrameClass.ROOM, listOf(message.size), clock(), signedUpTo = signedUpTo) -> {
+                    AutoReplyRefusal.NO_AIR
+                }
+
+                else -> {
+                    null
+                }
+            }
+        if (held != null) return held.name
+        log("lora dm from ${meshNodeLabel(packet.from.toLong())}: auto-reply queued")
+        enqueue(listOf(message), "autoreply", FrameClass.ROOM, AirBucket.PUBLIC, Destination.Reply, to = reply.to)
+        stateWake.trySend(Unit) // the sender is stamped now, not at the write: persist it with the ledger
+        return null
+    }
+
+    /** One inbound mesh frame off the air: reassemble, decode, dedup, and hand it to the router. */
+    private fun onFramePacket(packet: ReceivedPacket) {
+        val fragmented = packet.payload[0] == FastFrameCodec.TAG_FRAG
+        val compact = reassemble(packet) ?: return
+        val wire = FastFrameCodec.decodeCompact(compact)
+        if (wire == null) {
+            val reason = if (compact[0] == FastFrameCodec.TAG_TRANSCODED) FastPathDrop.TRANSCODE_FAILED else FastPathDrop.DECODE_FAILED
+            metrics.onFastDropped(reason)
+            return
+        }
+        val env = WireCodec.decodeEnvelope(wire.signed) ?: return
+        if (env.senderId == selfIdCached) return // our own frame echoed back over the mesh
+        sigSeen.add(dedupKey(wire, env)) // so the composite's relay re-fanout doesn't bounce it back over LoRa
+        // Presence, and ONLY presence, is gated on the frame's age: a backfill, a re-offer or a re-fan of
+        // something a spool just handed a gateway says where a *frame* has been, not where its author is.
+        // Everything below runs either way — this path must never become a propagation black hole.
+        // And only from a radio outside our pocket: a co-pocket gateway airs what our own radios carried to it,
+        // so its copy says the author is one BLE/NAN hop from *it*, never that the LoRa hop reaches them from
+        // here (ADR 2026-09.6gk8). Read as reach, it sent every ✓✓ owed to a board-less co-pocket author onto the
+        // air, where no board could carry it anywhere our radios had not already been.
+        if (isPresenceEvidence(env, wallClock()) && !airedByPocket(packet.from, pocketKeys())) {
+            noteReachable(Peer(env.senderId), packet.from)
+        }
+        metrics.onLoraReceived()
+        if (fragmented) metrics.onLoraReassembled()
+        if (LoraFramePolicy.isDmForm(env)) metrics.onLoraDmReceived()
+        _inbound.tryEmit(InboundFrame(wire, env, fromNodeId = env.senderId))
+        // Our held set just changed, so the next OFFER carries new information: snap the gossip timer back
+        // to its floor rather than announcing a stale picture at the backed-off interval.
+        gossip.reset(clock())
+        gossipWake.trySend(Unit)
+        log("lora rx ${env.type} id=${env.id} from ${env.senderId}")
+    }
+
+    /** Returns the complete frame for [packet]: itself if a whole `0x03`/`0x05` frame, else reassembled from `0x04` parts. */
+    private fun reassemble(packet: ReceivedPacket): ByteArray? =
+        when (packet.payload[0]) {
+            FastFrameCodec.TAG_COMPACT, FastFrameCodec.TAG_TRANSCODED -> {
+                packet.payload
+            }
+
+            FastFrameCodec.TAG_FRAG -> {
+                val frag = FastFrameCodec.parseFragment(packet.payload) ?: return null
+                reassembler.accept(packet.from, frag)?.takeIf { it.isNotEmpty() && FastFrameCodec.isFrameTag(it[0]) }
+            }
+
+            else -> {
+                metrics.onFastDropped(FastPathDrop.UNKNOWN_TAG)
+                null
+            }
+        }
+
+    /**
+     * Records that the radio [from] is on air. Separate from [noteReachable] because they answer different
+     * questions: this one counts **radios**, that one counts the **people** whose frames reached us — and the
+     * two diverge the moment a gateway relays or backfills somebody else's frame, which is the whole point of
+     * the bridge. Reporting the second as the first read as a phantom radio in the field.
+     */
+    private fun noteBoard(packet: ReceivedPacket) {
+        val from = packet.from
+        if (from == 0u) return // undecoded `from`; counting it would invent a radio
+        if (from == (link.state.value as? LinkState.Ready)?.board?.myNodeNum) return // our own board's echo
+        val heard = RxQuality(packet.rxSnr, packet.rxRssi, clock())
+        boardsHeardAt.compute(from) { _, previous -> previous?.refreshedBy(heard) ?: heard }
+        publishStatus()
+    }
+
+    private fun noteReachable(
+        peer: Peer,
+        board: UInt,
+    ) {
+        val now = clock()
+        val firstHeard = lastHeardAt.put(peer.nodeId, now) == null
+        heardPeers[peer.nodeId] = peer
+        heardVia[peer.nodeId] = board
+        recomputeReachable(now)
+        if (firstHeard) {
+            scope.launch {
+                beaconProfile(FIRST_HEARING_GAP_MS)
+                reofferTo(peer)
+            }
+        }
+    }
+
+    /**
+     * Whether [board] is a radio in our own pocket — our own board, heard back through a repeater, or one whose
+     * OFFERs name a node we hold a live link to ([pocket], the [pocketKeys] of the moment). Anything it airs
+     * reached us over BLE/NAN too, or will: its copy is an echo of our pocket, never evidence of the LoRa hop.
+     * A radio we have not heard OFFER yet is taken as far, which is today's reading and the safe one — a
+     * wrongly withheld hearing strands a far pocket's ✓✓ (ADR 2026-09.wkbk).
+     */
+    private fun airedByPocket(
+        board: UInt,
+        pocket: Set<Long>,
+    ): Boolean {
+        if (board == (link.state.value as? LinkState.Ready)?.board?.myNodeNum) return true
+        return boardOwners[board]?.publisher?.let { it in pocket } == true
+    }
+
+    private fun recomputeReachable(now: Long) {
+        lastHeardAt.entries.removeAll { now - it.value > REACHABLE_LINGER_MS }
+        boardsHeardAt.entries.removeAll { now - it.value.atMs > REACHABLE_LINGER_MS }
+        boardOwners.entries.removeAll { now - it.value.atMs > REACHABLE_LINGER_MS }
+        val pocket = pocketKeys()
+        lastHeardAt.keys.removeAll { author -> heardVia[author]?.let { airedByPocket(it, pocket) } == true }
+        heardVia.keys.retainAll(lastHeardAt.keys)
+        heardPeers.keys.retainAll(lastHeardAt.keys)
+        _reachable.value = heardPeers.values.toSet()
+        publishStatus()
+    }
+
+    private suspend fun lingerSweepLoop() {
+        while (scope.isActive) {
+            // [quiesce] has already emptied everything this would sweep, so an unconfigured pass could only
+            // re-run the election over an empty heard set — once a minute, on most installs, forever.
+            awaitConfigured()
+            delay(lingerSweepMs)
+            recomputeReachable(clock())
+            // Also re-run the election on a timer. Both its event triggers can go quiet at once — a passive
+            // board stops offering, and if the gateway it stood down for goes silent too, nothing would ever
+            // expire it from the heard set. Being wrongly passive is total silence, so it must not need an
+            // event to recover from.
+            recomputeRole()
+        }
+    }
+
+    // --- config + state ---
+
+    private fun onConfig(cfg: LoraConfig?) {
+        currentConfig = cfg
+        if (cfg == null) {
+            quiesce()
+        } else {
+            configured.value = true
+            link.start(cfg.address)
+        }
+        publishStatus()
+    }
+
+    private fun onLinkState(state: LinkState) {
+        _health.value =
+            when (state) {
+                is LinkState.Ready -> TransportHealth.Healthy
+                LinkState.Connecting, LinkState.Bonding, is LinkState.Handshaking, is LinkState.Disconnected -> TransportHealth.Degraded
+                LinkState.Idle, LinkState.Unavailable, is LinkState.NeedsPairing, is LinkState.StaleBond -> TransportHealth.Unavailable
+            }
+        if (state is LinkState.Ready) {
+            maxPayload = (state.mtu - TORADIO_OVERHEAD).coerceIn(LoraFrameCodec.MIN_PAYLOAD, MeshtasticProto.MAX_PAYLOAD)
+            val evicted = pace.evictOversize(maxPayload)
+            abandonShed()
+            if (evicted > 0) {
+                repeat(evicted) { metrics.onLoraTooBig() }
+                log("lora ready: evicted $evicted queued frame(s) chunked past the negotiated cap $maxPayload")
+            }
+            metrics.onLoraSessionUp()
+            // The pacer parks itself while the link is down, so the queue it kept across the outage only
+            // moves again if the session-up wakes it.
+            wake.trySend(Unit)
+            pace.airtime.onRadioConfig(state.radio)
+            // 2.8 signs the broadcasts it sends for us, which is airtime the budget has to know about.
+            pace.airtime.onFirmware(state.board.firmwareVersion, state.board.hasXeddsa)
+            log(
+                "lora ready board=${state.board.myNodeNum} mtu=${state.mtu} maxPayload=$maxPayload " +
+                    "radio=${state.radio?.region}/${state.radio?.modemPreset} " +
+                    "fw=${state.board.firmwareVersion} signing=${pace.airtime.signing}",
+            )
+            scope.launch { beaconProfile(PROFILE_FLOOR_MS) }
+            // The key is advertised only while the board signs: a key that never signs verifies nothing,
+            // and a pre-2.8 user's profile should not grow by it.
+            val signingKey =
+                state.board.owner
+                    ?.publicKey
+                    ?.takeIf { pace.airtime.signing }
+            scope.launch { onBoardBound(BoardBinding(state.board.myNodeNum, signingKey)) }
+        }
+        publishStatus()
+    }
+
+    private fun publishStatus() {
+        val board = (link.state.value as? LinkState.Ready)?.board
+        // The freshest reading among the radios still within the linger — the row's "last heard", now bounded
+        // to radios this plane actually talks to. Empty once they all age out, which is the honest answer.
+        val lastRx = boardsHeardAt.values.maxByOrNull { it.atMs }
+        _status.value =
+            LoraStatus(
+                state = link.state.value,
+                boardAddress = currentConfig?.address,
+                boardNodeNum = board?.myNodeNum,
+                lastSnr = lastRx?.snr,
+                lastRssi = lastRx?.rssi,
+                queueFree = link.queue.value?.free,
+                queued = pace.pending,
+                heard = _reachable.value.size,
+                boardsHeard = boardsHeardAt.size,
+                battery = link.battery.value,
+                boardAir = link.boardAir.value,
+                airtime = pace.airtime.snapshot(clock()),
+                role = role,
+                pocketLinks = linkedPeers.size,
+                pocketSightings = foreignReachable.size,
+                internetCovered = internetPeers.size,
+                gatewaysHeard = gateway.heard,
+            )
+    }
+
+    /**
+     * The window's dedup key. Keyed on the signature rather than the frame id because a re-seal keeps its
+     * id (`resealAndFlood`) and carries a fresh signature that must not be suppressed by a ten-minute-old
+     * entry. An **unsigned** frame (the v3 live-link tick, ADR 059) has no signature to key on — every one
+     * would collapse to the empty key and the first would silence the rest for the window — so it keys on
+     * its id, which is exact for that form: AckSync seals a tick once and re-sends it verbatim, never
+     * re-sealing under the same id. A distinct namespace so the two kinds of key can never collide.
+     */
+    private fun dedupKey(
+        wire: WireEnvelope,
+        env: RelayEnvelope,
+    ): String = if (wire.sig.isEmpty()) "u:${env.id}" else sigKey(wire)
+
+    /**
+     * [fastSend]'s dedup key. A cleartext receipt is rebuilt with a fresh id — so a fresh signature — on every
+     * AckSync attempt, and keyed as [dedupKey] keys it no two copies of one tick ever matched: a retry pass
+     * queued the whole owed set again behind the copies still waiting for air. Keyed on what it says instead —
+     * (recipient, acked id) — the window holds one packet per tick (ADR 2026-09.6gk8). The sealed form needs
+     * none of this: its retries are verbatim, so the signature already repeats.
+     */
+    private fun targetedKey(
+        wire: WireEnvelope,
+        env: RelayEnvelope,
+        to: Peer,
+    ): String {
+        if (env.type != FrameType.RECEIPT) return dedupKey(wire, env)
+        val ackId = WireCodec.decodePayload<ReceiptContent>(env.payload)?.ackId ?: return dedupKey(wire, env)
+        return "r:${to.nodeId}:$ackId"
+    }
+
+    private fun sigKey(wire: WireEnvelope): String {
+        val n = minOf(SIG_KEY_BYTES, wire.sig.size)
+        return buildString(n * 2) { for (i in 0 until n) append("%02x".format(wire.sig[i])) }
+    }
+
+    /** Tuning constants; not private so the JVM tests can assert against the numbers rather than restate them. */
+    companion object {
+        /**
+         * Hops a Knit packet is born with. It has to be **stated**: omitting `hop_limit` was documented as
+         * riding the node's configured default and does not — 2.8 leaves the field at zero, so every frame
+         * reached the air already spent and nothing has ever repeated one (measured 2026-09-04; both the
+         * evidence and the airtime it costs are in `context/lora-bridge.md`). Three is the Meshtastic
+         * default and what every stock node around us sends, which is the point: ADR 045 buys its reach by
+         * being ordinary traffic to the neighbours it borrows hops from.
+         *
+         * Reading the board's own `lora.hop_limit` instead is the obvious refinement and is deliberately not
+         * done here: the field is absent on a board that never set it, which decodes as 0 — the exact value
+         * that caused this, and a silent regression the moment a board reports it.
+         */
+        const val HOP_LIMIT = 3
+
+        /**
+         * The shortest gap between two posts this gateway puts on the foreign public channel (§5 of work
+         * item #37).
+         *
+         * The binding limit in practice, ahead of [AirBucket.PUBLIC]'s share, and that ordering is the point:
+         * a refusal a user can predict ("wait a moment") beats one that depends on what the rest of the plane
+         * happened to be doing. It also bounds the worst case a bridge can inflict on a shared community band
+         * — a whole pocket of Knit users is still one voice every 30 s, not one each.
+         */
+        const val PUBLIC_POST_FLOOR_MS = 30_000L
+
+        /** [OutboundFrame.supersedes] for the OFFER — one publisher, so one key. */
+        private const val OFFER_KEY = "offer"
+
+        /**
+         * [OutboundFrame.supersedes] for a `profile` frame: one queued copy per author, newest wins.
+         *
+         * Per author rather than one for the whole class, because two peers' profiles are different state and
+         * neither replaces the other — the thing being superseded is "what this author last published".
+         */
+        private fun profileKey(authorId: String?): String = "profile:${authorId.orEmpty()}"
+
+        const val INBOUND_BUFFER = 64
+        const val SIG_TTL_MS = 10 * 60_000L // = SeenSet.DEFAULT_TTL_MS
+        const val SIG_KEY_BYTES = 8
+        const val FRAG_CAP = 16
+        const val FRAG_TIMEOUT_MS = 60_000L // LoRa parts are seconds apart; the NAN 5 s default would drop them
+        const val FRAG_ID_MASK = 0xFFFF
+        const val REACHABLE_LINGER_MS = 45 * 60_000L
+
+        /**
+         * How often a DM may go out as a probe to a recipient this plane has not heard (ADR 2026-10.a4pm): one
+         * airtime window, so an absent recipient costs at most one DM's air per window.
+         */
+        const val DM_PROBE_WINDOW_MS = 15 * 60_000L
+        const val LINGER_SWEEP_MS = 60_000L
+        const val PROFILE_FLOOR_MS = 5 * 60_000L
+
+        /**
+         * How long a profile publish that has ridden this plane is not re-fanned for — the author's own
+         * republish period (`MeshManager.PROFILE_REPUBLISH_MS`), because a republish mints a new frame id and
+         * rides on its own merits, so anything shorter only re-sends bytes the horizon already has.
+         *
+         * It was effectively 10 minutes, and not by design: a relayed profile was gated only by [sigSeen],
+         * whose TTL matches `MeshRouter`'s SeenSet, so a profile that kept arriving looked first-seen again on
+         * every lapse and re-fanned forever. `LoraFramePolicy.isFresh` exempts a profile from the staleness
+         * check (its `sentAt` is a publish stamp, hours old by design), so nothing else stopped it either. On
+         * the lab gateway that made profiles 79 % of every LoRa frame the phone had ever sent (ADR 057).
+         */
+        const val PROFILE_REFAN_MS = 12 * 60 * 60_000L
+        const val FIRST_HEARING_GAP_MS = 60_000L
+        const val NEVER = Long.MIN_VALUE
+
+        // Limiters that outlive the process (LoraPlaneState).
+
+        /**
+         * How long the plane waits for its persisted limiters before transmitting anyway. Generous against a
+         * cold DataStore read and still far inside the board's own BLE handshake, so in practice nothing ever
+         * waits on it — it exists so that a store which never answers costs one window rather than the plane.
+         */
+        const val STATE_LOAD_TIMEOUT_MS = 5_000L
+
+        /** How long a spend waits for its neighbours before the snapshot is written. */
+        const val STATE_SAVE_DEBOUNCE_MS = 2_000L
+
+        /**
+         * The most profile publishes carried across a restart. The gate is per publish and a pocket makes a
+         * handful a day, so this is slack rather than a limit — but [profileSeen] itself holds thousands, and
+         * a preferences blob is the wrong place for them.
+         */
+        const val STATE_PROFILE_CAP = 128
+
+        /** The most answered DM senders carried across a restart — [DmAutoReplyPolicy.MAX_SENDERS], all of them. */
+        const val STATE_AUTO_REPLY_CAP = DmAutoReplyPolicy.MAX_SENDERS
+
+        /**
+         * The most probe stamps carried across a restart, newest kept. One per recipient a DM went to unheard
+         * inside the last [DM_PROBE_WINDOW_MS] — a handful — so this is slack, not a limit.
+         */
+        const val STATE_DM_PROBE_CAP = 64
+
+        /**
+         * How long one frame stays re-offered (ADR 2026-10.a4pm): an hour, longer than the 45-min linger, so the
+         * same backlog is not re-aired on every first hearing of a peer heard only now and then.
+         */
+        const val REOFFER_MEMORY_MS = 60 * 60_000L
+
+        /** The most re-offered frame ids carried across a restart, newest kept — a few sightings' worth. */
+        const val STATE_REOFFER_CAP = 64
+
+        // The bridge (ADR 044).
+        const val BACKFILL_LIMIT = 4 // frames per offer heard
+        const val SERVE_CAP_PER_HOUR = 12 // frames per far gateway per hour
+        const val SERVE_WINDOW_MS = 60 * 60_000L
+        const val CANDIDATE_SLACK = 3 // ask custody for more than we can send: some won't encode, or won't fit the window
+        const val HEX = 16
+
+        /**
+         * A floor on the gossip and pacer loops' waits, so a zero-length wait can never become a busy loop.
+         * Both compute their wait from a transmit point that can already be in the past while transmitting is
+         * still impossible (the board down, its queue full, the hour's airtime spent).
+         */
+        const val IDLE_TICK_MS = 1_000L
+
+        /** [resolveSelfId]'s backoff after a read that threw: doubling from the first to the second. */
+        const val SELF_ID_RETRY_MIN_MS = 1_000L
+        const val SELF_ID_RETRY_MAX_MS = 60_000L
+
+        /** The ATT write header: one opcode byte and a two-byte handle, so a write carries `mtu - 3` bytes. */
+        const val ATT_HEADER_BYTES = 3
+
+        /**
+         * Bytes a ToRadio{packet} adds around the Data.payload on the BLE write — the ATT header plus the
+         * measured protobuf framing ([MeshtasticProto.PACKET_OVERHEAD]) — so `mtu - this` is the largest
+         * payload that still fits one ATT write. Was a hand-set 33 with 6 B of unaccounted slack; at the
+         * MTU-255 ESP32 boards that slack was the difference between a one-packet v3 tick and two (ADR 059).
+         */
+        val TORADIO_OVERHEAD: Int = ATT_HEADER_BYTES + MeshtasticProto.PACKET_OVERHEAD
+
+        /** The smallest ATT MTU a real board negotiates (the ESP32 line's 255); a failed negotiation is caught lower, at `MIN_MTU`. */
+        const val MTU_FLOOR = 255
+
+        /**
+         * The payload cap in force before a board has reported its MTU: what an [MTU_FLOOR] board takes, never
+         * more than [MeshtasticProto.MAX_PAYLOAD]. Ready replaces it with the negotiated figure.
+         */
+        val PRE_READY_PAYLOAD: Int = minOf(MeshtasticProto.MAX_PAYLOAD, MTU_FLOOR - TORADIO_OVERHEAD)
+    }
+}
+
+/**
+ * Why a slot-0 chat packet was dropped before [PublicChannelPolicy] ever saw it: the user switched the
+ * Meshtastic room off. A refusal name rather than a counter of its own, beside `BLOCKED_CONTACT`, because it
+ * belongs in the same "heard on the primary and not delivered" tally the rest of the reasons share.
+ */
+internal const val MESH_POST_ROOM_OFF = "ROOM_OFF"
+
+/**
+ * Its sibling for a board pinned to a dedicated RF slot (ADR 067): the room is hidden there, so a slot-0 chat
+ * packet has nowhere to go and is dropped at the same point.
+ */
+internal const val MESH_POST_DEDICATED = "DEDICATED"
+
+/**
+ * What a board reports about itself when its session comes up, for the profile to advertise: its node number
+ * and — only on firmware that signs — the Curve25519 key it signs under (base64, off its own `NodeInfo`).
+ */
+internal data class BoardBinding(
+    val nodeNum: UInt,
+    val signingKey: String?,
+)
+
+/** Which Knit node a radio's OFFERs name as their publisher, and when one was last heard from it. */
+private data class OfferedBy(
+    val publisher: Long,
+    val atMs: Long,
+)

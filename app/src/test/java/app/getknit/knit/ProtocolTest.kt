@@ -1,0 +1,90 @@
+package app.getknit.knit
+
+import app.getknit.knit.mesh.protocol.Protocol
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ProtocolTest {
+    @Test
+    fun advertiseParseRoundTrips() {
+        // A real 26-char base32 nodeId (contains no '|', so the split-on-'|' round-trips cleanly).
+        val id = "ffbbh6thbepahqxsv2gqog45m4"
+        val parsed = Protocol.parse(Protocol.advertise(id))
+        assertEquals(id, parsed.nodeId)
+        assertEquals(Protocol.VERSION, parsed.protoVersion)
+        assertEquals(Protocol.LOCAL_CAPABILITIES, parsed.capabilities)
+    }
+
+    @Test
+    fun bareLegacyNodeIdParsesToUnknownVersion() {
+        // A peer that advertises just its nodeId (a pre-protocol build) is "unknown" — version 0, no caps.
+        val parsed = Protocol.parse("abcd1234")
+        assertEquals("abcd1234", parsed.nodeId)
+        assertEquals(0, parsed.protoVersion)
+        assertEquals(0L, parsed.capabilities)
+    }
+
+    @Test
+    fun parseNeverThrowsOnGarbageSegments() {
+        val parsed = Protocol.parse("abcd1234|notanint|zzz")
+        assertEquals("abcd1234", parsed.nodeId)
+        assertEquals(0, parsed.protoVersion)
+        assertEquals(0L, parsed.capabilities)
+    }
+
+    @Test
+    fun cryptoV3RidesTheProfileAboveTheBleAdvertsEightBits() {
+        // ADR 059: the bit is a send-time input read from the pinned profile; it deliberately sits above the
+        // 8 bits a BLE advert carries (0x80 is the transcoder's — ADR 060), and every local build claims it.
+        assertTrue(Protocol.LOCAL_CAPABILITIES and Protocol.CAP_CRYPTO_V3 != 0L)
+        assertTrue(Protocol.CAP_CRYPTO_V3 > 0xFFL)
+        assertEquals(0x100L, Protocol.CAP_CRYPTO_V3)
+    }
+
+    @Test
+    fun theTranscoderBitIsTheLastOneABleAdvertCarries() {
+        // ADR 060: read from the advert copy like CAP_FAST_COMPACT (a transport-local encoding choice), so it
+        // has to sit inside the 8 bits a BLE advert carries — and it is the last of them.
+        assertEquals(0x80L, Protocol.CAP_FRAME_TRANSCODE)
+        assertTrue(Protocol.LOCAL_CAPABILITIES and Protocol.CAP_FRAME_TRANSCODE != 0L)
+        assertTrue(Protocol.CAP_FRAME_TRANSCODE <= 0xFFL)
+    }
+
+    @Test
+    fun linkPreviewCardsRideTheProfileLikeFiles() {
+        // A send-time input read from the pinned profile, the next bit after files, above the BLE advert's
+        // eight bits; every local build claims it.
+        assertEquals(0x400L, Protocol.CAP_LINK_PREVIEW)
+        assertTrue(Protocol.LOCAL_CAPABILITIES and Protocol.CAP_LINK_PREVIEW != 0L)
+        assertTrue(Protocol.CAP_LINK_PREVIEW > 0xFFL)
+        assertEquals(Protocol.CAP_FILES shl 1, Protocol.CAP_LINK_PREVIEW)
+    }
+
+    @Test
+    fun theDoorbellBitIsTheIphonesAndNeverOurs() {
+        // ADR 2026-09.dqvb: the next bit after direct transfer, read from the HELLO by the Bluetooth transport only.
+        // Android serves no GATT doorbell, so no local build claims it.
+        assertEquals(0x1000L, Protocol.CAP_DOORBELL)
+        assertEquals(Protocol.CAP_DIRECT_TRANSFER shl 1, Protocol.CAP_DOORBELL)
+        assertEquals(0L, Protocol.LOCAL_CAPABILITIES and Protocol.CAP_DOORBELL)
+        assertEquals(Protocol.CAP_DOORBELL, Protocol.parse("ffbbh6thbepahqxsv2gqog45m4|1|1009").capabilities and Protocol.CAP_DOORBELL)
+    }
+
+    @Test
+    fun everyBuildAnswersAHolderQuery() {
+        // ADR 2026-10.6e5t: the next bit after the doorbell, above the advert's 8 bits, and in every build — only the
+        // asking is gated (BuildConfig.BLOB_QUERY), so a mixed fleet answers whoever asks.
+        assertEquals(0x2000L, Protocol.CAP_BLOB_HAVE)
+        assertEquals(Protocol.CAP_DOORBELL shl 1, Protocol.CAP_BLOB_HAVE)
+        assertEquals(Protocol.CAP_BLOB_HAVE, Protocol.LOCAL_CAPABILITIES and Protocol.CAP_BLOB_HAVE)
+        val advertised = Protocol.parse(Protocol.advertise("ffbbh6thbepahqxsv2gqog45m4")).capabilities
+        assertEquals(Protocol.CAP_BLOB_HAVE, advertised and Protocol.CAP_BLOB_HAVE)
+    }
+
+    @Test
+    fun nodeIdIsAlwaysTheFirstSegment() {
+        // Robust to any future suffix appended after the capabilities field.
+        assertEquals("abcd1234", Protocol.parse("abcd1234|1|f|future|stuff").nodeId)
+    }
+}

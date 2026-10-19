@@ -1,0 +1,265 @@
+package app.getknit.knit.mesh.lora
+
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import java.util.concurrent.CopyOnWriteArrayList
+
+/**
+ * A tiny in-memory LoRa "air": every registered [FakeMeshtasticLink] floods each send to every OTHER
+ * registered link (a board never echoes the phone's own packet back), so two [LoraMeshTransport]s can be
+ * exercised end-to-end on the JVM with no radio and no GATT. Single-threaded by test contract.
+ */
+internal class FakeMeshtasticAir {
+    // Copy-on-write: the mesh-in-a-box lab registers boards from one node's coroutine while another node is
+    // already broadcasting on Dispatchers.Default; the single-SUT rigs are single-threaded either way.
+    private val links = CopyOnWriteArrayList<FakeMeshtasticLink>()
+    var lossy: (from: UInt, to: UInt) -> Boolean = { _, _ -> false }
+
+    fun register(link: FakeMeshtasticLink) {
+        links += link
+    }
+
+    fun unregister(link: FakeMeshtasticLink) {
+        links -= link
+    }
+
+    fun broadcast(
+        from: UInt,
+        channelIndex: Int,
+        portnum: Int,
+        payload: ByteArray,
+    ) {
+        links
+            .filter { it.nodeNum != from && !lossy(from, it.nodeNum) }
+            .forEach { it.deliver(from, channelIndex, portnum, payload) }
+    }
+}
+
+/** A [MeshtasticLink] backed by [FakeMeshtasticAir]; goes Ready on start and floods sends to the air. */
+internal class FakeMeshtasticLink(
+    val nodeNum: UInt,
+    private val air: FakeMeshtasticAir,
+    private val channelName: String = KnitChannel.NAME,
+    /** What the handshake reports as the board's firmware. Pre-2.8 by default: the signature era is opt-in. */
+    private val firmware: String = "2.5.0",
+    /** The board's own `User.public_key` (base64), as its NodeInfo would carry it; null on a board that published none. */
+    private val publicKey: String? = null,
+) : MeshtasticLink {
+    /** The board's own identity as the handshake reports it — named like a stock board, keyed when [publicKey] says so. */
+    private val boardInfo: BoardInfo
+        get() =
+            BoardInfo(
+                nodeNum,
+                "heltec-v4",
+                firmware,
+                owner = publicKey?.let { BoardOwner("Meshtastic $nodeNum", "$nodeNum", publicKey = it) },
+            )
+    private val _state = MutableStateFlow<LinkState>(LinkState.Idle)
+    override val state = _state
+
+    private val _packets = MutableSharedFlow<ReceivedPacket>(extraBufferCapacity = 256)
+    override val packets = _packets
+
+    private val _outcomes = MutableSharedFlow<PacketOutcome>(extraBufferCapacity = 64)
+    override val outcomes = _outcomes
+
+    private val _queue = MutableStateFlow<QueueInfo?>(QueueInfo(free = 16, maxlen = 16, atMs = 0))
+    override val queue = _queue
+
+    override val battery = MutableStateFlow<BoardBattery?>(null)
+
+    override val boardAir = MutableStateFlow<BoardAir?>(null)
+
+    /** The mesh's NodeDB as the board reports it — what puts a name on a bridged LongFast post. */
+    override val nodes = MutableStateFlow<Map<UInt, BoardOwner>>(emptyMap())
+
+    /** The board's free-slot count. Assigning it also publishes a [queue] update, as a real QueueStatus does. */
+    var free: Int = 16
+        set(value) {
+            field = value
+            _queue.value = QueueInfo(free = value, maxlen = 16, atMs = 0)
+        }
+
+    /**
+     * When set, each accepted send costs a queue slot, the way a real board's does — so a fragmented frame
+     * can run the board out of room part-way and get [SendResult.Busy] for the rest of itself. Off by
+     * default: most tests want a board that always has room.
+     */
+    var queueFills = false
+
+    /** When set, the next send is refused with this NAK — the board's duty-cycle or rate refusal — and it clears. */
+    var nakNext: RoutingError? = null
+    private var nextId = 1u
+    val sent = mutableListOf<ByteArray>()
+
+    /**
+     * The `hop_limit` each send asked for, positionally alongside [sent]. Recorded because the field being
+     * **absent** is a bug the payload cannot show: a packet born with zero hops is on the air, decodes, and
+     * is simply never repeated by anyone.
+     */
+    val sentHopLimits = mutableListOf<Int?>()
+
+    /**
+     * The channel index and portnum each send asked for, positionally alongside [sent]. Both are invisible
+     * in the payload and both are the whole difference between a Knit frame and a post on somebody else's
+     * public channel, so a transmit that went to the wrong one would otherwise look identical here.
+     */
+    val sentChannels = mutableListOf<Int>()
+    val sentPortnums = mutableListOf<Int>()
+
+    /** The `to` of each send, positionally alongside [sent]: the broadcast address for all but a DM auto-reply. */
+    val sentTos = mutableListOf<UInt>()
+
+    override suspend fun send(
+        payload: ByteArray,
+        channelIndex: Int,
+        portnum: Int,
+        hopLimit: Int?,
+        to: UInt,
+    ): SendResult {
+        if (free == 0) return SendResult.Busy
+        nakNext?.let { reason ->
+            nakNext = null
+            return SendResult.Nak(nextId++, reason)
+        }
+        sent += payload
+        sentHopLimits += hopLimit
+        sentChannels += channelIndex
+        sentPortnums += portnum
+        sentTos += to
+        val id = nextId++
+        if (queueFills) free--
+        air.broadcast(nodeNum, channelIndex, portnum, payload)
+        return SendResult.Queued(id, QueueInfo(free, 16, 0))
+    }
+
+    /** What [provisionChannel] returns; a test can script a different outcome. */
+    var provisionResult: ProvisionResult = ProvisionResult.Provisioned(index = 1, alreadyPresent = false)
+    val provisioned = mutableListOf<ProvisionSpec>()
+
+    override suspend fun provisionChannel(spec: ProvisionSpec): ProvisionResult {
+        provisioned += spec
+        return provisionResult
+    }
+
+    /** Off to model a board still connecting after [start]: the state parks at Connecting until [ready]. */
+    var readyOnStart = true
+
+    override fun start(address: String) {
+        if (readyOnStart) ready() else _state.value = LinkState.Connecting
+        air.register(this)
+    }
+
+    /** The handshake completing (at ATT MTU 512, the ESP32 line's ceiling): what a real board reports last. */
+    fun ready() {
+        _state.value = LinkState.Ready(boardInfo, listOf(ChannelInfo(0, channelName, 1)), 512)
+    }
+
+    /**
+     * The handshake as a **provisioned** board reports it: the primary at index 0 and the Knit channel in a
+     * secondary slot, plus the radio settings. The shape ADR 045 actually produces — [ready]'s single Knit
+     * channel at index 0 is a lab binding, and on such a board there is no primary for the Meshtastic room
+     * to mirror.
+     */
+    fun readyProvisioned(
+        knitIndex: Int = 1,
+        primaryName: String = "",
+        primaryPsk: ByteArray = ByteArray(0),
+        radio: LoraRadioConfig? =
+            LoraRadioConfig(
+                usePreset = true,
+                modemPreset = ModemPreset.LONG_FAST,
+                region = LoraRegion.US,
+                hopLimit = 3,
+                overrideDutyCycle = false,
+            ),
+    ) {
+        _state.value =
+            LinkState.Ready(
+                boardInfo,
+                listOf(
+                    ChannelInfo(0, primaryName, role = 1, psk = primaryPsk),
+                    ChannelInfo(knitIndex, KnitChannel.NAME, role = 2, psk = KnitChannel.PSK),
+                ),
+                512,
+                radio,
+            )
+    }
+
+    override fun stop() {
+        air.unregister(this)
+        _state.value = LinkState.Idle
+    }
+
+    /** A packet arriving from the air (another board's broadcast). */
+    fun deliver(
+        from: UInt,
+        channelIndex: Int,
+        portnum: Int,
+        payload: ByteArray,
+        rxSnr: Float? = 6.5f,
+        rxRssi: Int? = -85,
+    ) {
+        _packets.tryEmit(
+            ReceivedPacket(
+                from = from,
+                to = MeshtasticProto.BROADCAST,
+                id = nextId++,
+                channelIndex = channelIndex,
+                portnum = portnum,
+                payload = payload,
+                rxSnr = rxSnr,
+                rxRssi = rxRssi,
+                hopsAway = 0,
+            ),
+        )
+    }
+
+    /**
+     * A Meshtastic node's chat on the primary channel — what the Meshtastic room reads. Not routed through
+     * [air], which only carries Knit's own channel: a stock neighbour is not a registered board and its
+     * packets reach exactly the phones whose radios heard them.
+     */
+    fun deliverPublicText(
+        from: UInt,
+        body: String,
+        id: UInt = nextId++,
+        viaMqtt: Boolean = false,
+        to: UInt = MeshtasticProto.BROADCAST,
+        signature: ByteArray? = null,
+        boardVerified: Boolean = false,
+    ) {
+        _packets.tryEmit(
+            ReceivedPacket(
+                from = from,
+                to = to,
+                id = id,
+                channelIndex = PublicChannelPolicy.PRIMARY_INDEX,
+                portnum = MeshtasticProto.PORT_TEXT_MESSAGE,
+                payload = body.encodeToByteArray(),
+                rxSnr = -6.5f,
+                rxRssi = -110,
+                hopsAway = 1,
+                viaMqtt = viaMqtt,
+                signature = signature,
+                boardVerified = boardVerified,
+            ),
+        )
+    }
+
+    fun emitNak(
+        id: UInt,
+        reason: RoutingError,
+    ) {
+        _outcomes.tryEmit(PacketOutcome(id, reason))
+    }
+
+    fun updateHeadroom(value: Int) {
+        free = value
+        _queue.value = QueueInfo(value, 16, 0)
+    }
+
+    fun drop() {
+        _state.value = LinkState.Disconnected("test", retryAtMs = 0, streak = 1)
+    }
+}

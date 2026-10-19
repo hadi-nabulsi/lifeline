@@ -1,0 +1,112 @@
+package app.getknit.knit.mesh.bluetooth
+
+/**
+ * The pure "which nearby peers should we hold a persistent Bluetooth link to?" decision — the BLE analogue of
+ * Wi-Fi Aware's `DigestTracker`/sync-wanted logic, but promotion is driven by **dwell + RSSI** (proximity)
+ * rather than a data-sync cue, because BLE links are cheap and persistent (no one-NDP cost). Bounded by a
+ * connection budget with weakest-first, hysteretic eviction so a dense crowd of transient passers-by can't
+ * thrash the link set.
+ *
+ * Fully pure (the caller supplies all clock-derived durations, like `PowerPolicy`), so it is JVM-unit-testable
+ * ([app.getknit.knit.PromotionPolicyTest]). The caller pre-filters [candidates] to peers it should initiate to
+ * (the nodeId tie-break `local > peer`, and not already linked).
+ */
+object PromotionPolicy {
+    /** A currently-held link's state, for the eviction decision. */
+    data class LinkSnapshot(
+        val nodeId: String,
+        val smoothedRssi: Double,
+        val ageMs: Long,
+        val idleMs: Long,
+    )
+
+    /** Node ids to open a link to, and node ids to tear a link down for, this tick. */
+    data class Decision(
+        val promote: List<String>,
+        val evict: List<String>,
+    )
+
+    fun decide(
+        candidates: List<BlePresenceTracker.Snapshot>,
+        links: List<LinkSnapshot>,
+        backoff: Set<String>,
+        config: PromotionConfig = PromotionConfig(),
+    ): Decision {
+        // Promotable = close enough (RSSI floor), stuck around (dwell), and not backing off — strongest first.
+        val promotable =
+            candidates
+                .filter { it.smoothedRssi >= config.rssiFloorDbm && it.dwellMs >= config.dwellThresholdMs && it.nodeId !in backoff }
+                .sortedByDescending { it.smoothedRssi }
+
+        // Links we're allowed to drop (held at least linkMinHoldMs — time hysteresis against thrash), weakest first.
+        val evictable = links.filter { it.ageMs >= config.linkMinHoldMs }.sortedBy { it.smoothedRssi }
+        val evict = mutableListOf<String>()
+
+        // Shed any strict overflow first (e.g. after accepting more inbound links than the budget), weakest go.
+        val overflow = (links.size - config.maxLinks).coerceAtLeast(0)
+        evict += evictable.take(overflow).map { it.nodeId }
+
+        val promote = mutableListOf<String>()
+        val free = config.maxLinks - (links.size - evict.size)
+        if (free > 0) {
+            promote += promotable.take(free).map { it.nodeId }
+        } else {
+            // At budget: replace the weakest still-evictable link only if the best candidate clearly beats it
+            // (RSSI hysteresis), so normal RSSI jitter can't ping-pong a link.
+            val weakest = evictable.drop(overflow).firstOrNull()
+            val best = promotable.firstOrNull()
+            if (weakest != null && best != null && best.smoothedRssi >= weakest.smoothedRssi + config.rssiHysteresisDb) {
+                promote += best.nodeId
+                evict += weakest.nodeId
+            }
+        }
+        return Decision(promote, evict)
+    }
+
+    /**
+     * How long until the first of [candidates] the floor and [backoff] already admit has dwelt long enough to promote,
+     * or null when none is waiting on its dwell. The connection loop sleeps no longer than this (ADR 2026-10.pj9w): on
+     * a screen-off phone the gap between scan windows is longer than `presenceGapResetMs`, so the next sighting would
+     * restart the dwell, not ripen it. The ordinary dial's twin of `LonelyDialPolicy.msUntilDue` (ADR 2026-09.hj4a).
+     */
+    fun msUntilDue(
+        candidates: List<BlePresenceTracker.Snapshot>,
+        backoff: Set<String>,
+        config: PromotionConfig = PromotionConfig(),
+    ): Long? =
+        candidates
+            .filter { it.smoothedRssi >= config.rssiFloorDbm && it.nodeId !in backoff && it.dwellMs < config.dwellThresholdMs }
+            .minOfOrNull { config.dwellThresholdMs - it.dwellMs }
+}
+
+/**
+ * Tunables for [PromotionPolicy]. Defaults sized for an always-on venue mesh; all field-tunable. BLE links are
+ * cheap, so [dwellThresholdMs] is seconds, not the ~90s a costly NAN NDP would justify.
+ */
+data class PromotionConfig(
+    /** Continuous presence before promoting — filters out passers-by. */
+    val dwellThresholdMs: Long = 12_000,
+    /** Smoothed-RSSI floor (edge of usable BLE range) in dBm; below this a peer is never promoted. BLE
+     *  reaches further than NAN's NDP, so this is set generously — it excludes only genuinely poor signals
+     *  rather than gating to same-room proximity. */
+    val rssiFloorDbm: Int = DEFAULT_RSSI_FLOOR_DBM,
+    /** Connection budget: max simultaneous persistent Bluetooth links. A debug build can lower it from
+     *  Diagnostics or the bridge (`SettingsStore.debugBleLinkCap`); release always runs the default. */
+    val maxLinks: Int = DEFAULT_MAX_LINKS,
+    /** A candidate must beat the weakest link by this many dB to evict it (RSSI jitter is ±5). */
+    val rssiHysteresisDb: Int = 8,
+    /** Never evict a link younger than this — time hysteresis so a fresh link isn't dropped immediately. */
+    val linkMinHoldMs: Long = 20_000,
+) {
+    companion object {
+        /** The shipped connection budget, and the ceiling of the debug link cap. */
+        const val DEFAULT_MAX_LINKS = 6
+
+        // A negative default can't be inlined without tripping MagicNumber, so it lives here as a named const.
+        // -90 keeps a small margin above typical BLE 1M-PHY sensitivity (~-90..-95 dBm): broaden reach to the
+        // edge of usable range without churning connect-backoff on doomed sub-sensitivity attempts. It reads the
+        // presence advert, which runs at full power (TX_POWER_HIGH, ADR 2026-10.ryak); at MEDIUM it stood 8 dB
+        // short of that edge, and two Pixels four metres apart in line of sight read -79..-90.
+        private const val DEFAULT_RSSI_FLOOR_DBM = -90
+    }
+}

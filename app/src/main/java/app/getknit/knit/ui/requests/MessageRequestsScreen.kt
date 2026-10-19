@@ -1,0 +1,362 @@
+package app.getknit.knit.ui.requests
+
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.getknit.knit.R
+import app.getknit.knit.notifications.Notifier
+import app.getknit.knit.ui.components.Avatar
+import app.getknit.knit.ui.components.GroupAvatar
+import app.getknit.knit.ui.components.PeerNameText
+import app.getknit.knit.ui.preview.KnitPreview
+import org.koin.androidx.compose.koinViewModel
+import org.koin.compose.koinInject
+
+/**
+ * The Message Requests inbox — the pending DM/group conversations partitioned out of the main chat list.
+ * Each row offers Accept (moves it into the chat list, then opens the thread via [onOpenConversation])
+ * plus, behind an overflow, Block (DM only) and Delete, each with a confirm dialog. Reached from the
+ * chat-list badge and from the quiet coalesced notification's deep-link.
+ */
+@Composable
+fun MessageRequestsScreen(
+    onBack: () -> Unit,
+    onOpenProfile: (nodeId: String) -> Unit,
+    onOpenConversation: (conversationId: String) -> Unit,
+    viewModel: MessageRequestsViewModel = koinViewModel(),
+) {
+    val requests by viewModel.requests.collectAsStateWithLifecycle()
+    val notifier = koinInject<Notifier>()
+    // While this inbox is on screen, suppress the coalesced "N message requests" heads-up (and clear any
+    // already showing) — mirrors ChatViewModel's per-conversation setVisibleConversation.
+    DisposableEffect(Unit) {
+        notifier.setRequestsVisible(true)
+        onDispose { notifier.setRequestsVisible(false) }
+    }
+    // Accepting a request opens the now-accepted thread rather than leaving the user in the inbox with
+    // one fewer row. The ViewModel emits only once the accept has persisted, so the write can't be
+    // cancelled by this screen (and its ViewModel) going away with the navigation.
+    LaunchedEffect(Unit) { viewModel.accepted.collect { onOpenConversation(it) } }
+    MessageRequestsScreenContent(
+        requests = requests,
+        onAccept = viewModel::accept,
+        onBlock = viewModel::block,
+        onDelete = viewModel::delete,
+        onOpenProfile = onOpenProfile,
+        onBack = onBack,
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun MessageRequestsScreenContent(
+    requests: List<RequestRow>,
+    onAccept: (conversationId: String) -> Unit,
+    onBlock: (nodeId: String) -> Unit,
+    onDelete: (conversationId: String) -> Unit,
+    onOpenProfile: (nodeId: String) -> Unit,
+    onBack: () -> Unit,
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                navigationIcon = {
+                    IconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+                title = { Text(stringResource(R.string.message_requests_title)) },
+            )
+        },
+    ) { padding ->
+        if (requests.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = stringResource(R.string.message_requests_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentPadding = PaddingValues(vertical = 8.dp),
+            ) {
+                items(requests, key = { it.conversationId }) { row ->
+                    RequestRowItem(
+                        row = row,
+                        onAccept = { onAccept(row.conversationId) },
+                        onBlock = { onBlock(row.conversationId) },
+                        onDelete = { onDelete(row.conversationId) },
+                        // A DM's conversationId is the peer's node id; a group has no single peer, so
+                        // its glyph stays non-interactive (RequestLeadingVisual ignores this then).
+                        onOpenProfile = { onOpenProfile(row.conversationId) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RequestRowItem(
+    row: RequestRow,
+    onAccept: () -> Unit,
+    onBlock: () -> Unit,
+    onDelete: () -> Unit,
+    onOpenProfile: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    var showBlockConfirm by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .testTag("request_row_${row.conversationId}")
+                .padding(start = 16.dp, top = 8.dp, end = 4.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RequestLeadingVisual(row, onOpenProfile = onOpenProfile)
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            PeerNameText(
+                text = row.title,
+                discriminator = row.discriminator,
+                style = MaterialTheme.typography.titleMedium,
+            )
+            row.lastPreview?.let { preview ->
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = preview,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.width(4.dp))
+        // Every row has an Accept and a More options, so each names its request: announced bare, a
+        // screen reader user hears the same two buttons once per row with nothing to tell them apart.
+        val acceptLabel = stringResource(R.string.message_requests_accept_desc, row.title)
+        TextButton(
+            onClick = onAccept,
+            modifier =
+                Modifier
+                    .testTag("request_accept_${row.conversationId}")
+                    .semantics { contentDescription = acceptLabel },
+        ) {
+            Text(stringResource(R.string.message_requests_accept))
+        }
+        Box {
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(
+                    Icons.Filled.MoreVert,
+                    contentDescription = stringResource(R.string.message_requests_more_desc, row.title),
+                )
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                // Block targets the DM peer (conversationId == node id); it has no meaning for a group.
+                if (!row.isGroup) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.message_requests_block)) },
+                        leadingIcon = { Icon(Icons.Filled.Block, contentDescription = null) },
+                        onClick = {
+                            menuOpen = false
+                            showBlockConfirm = true
+                        },
+                    )
+                }
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = stringResource(R.string.chat_list_delete_action),
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(
+                            Icons.Filled.Delete,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                        )
+                    },
+                    onClick = {
+                        menuOpen = false
+                        showDeleteConfirm = true
+                    },
+                )
+            }
+        }
+    }
+
+    if (showBlockConfirm) {
+        AlertDialog(
+            onDismissRequest = { showBlockConfirm = false },
+            title = { Text(stringResource(R.string.message_requests_block_confirm_title)) },
+            text = { Text(stringResource(R.string.message_requests_block_confirm_body)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    onBlock()
+                    showBlockConfirm = false
+                }) {
+                    Text(
+                        text = stringResource(R.string.message_requests_block),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBlockConfirm = false }) {
+                    Text(stringResource(android.R.string.cancel))
+                }
+            },
+        )
+    }
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text(stringResource(R.string.message_requests_delete_confirm_title)) },
+            text = { Text(stringResource(R.string.message_requests_delete_confirm_body)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDelete()
+                    showDeleteConfirm = false
+                }) {
+                    Text(
+                        text = stringResource(R.string.chat_list_delete_action),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text(stringResource(android.R.string.cancel))
+                }
+            },
+        )
+    }
+}
+
+/**
+ * Leading glyph: the group photo (or its members' cluster) for a group request, an [Avatar] for a DM request.
+ * The DM avatar is tappable — it opens the sender's profile (where Message accepts the request and opens
+ * the DM). A group request has no single peer, so its glyph stays non-interactive.
+ */
+@Composable
+private fun RequestLeadingVisual(
+    row: RequestRow,
+    onOpenProfile: () -> Unit,
+) {
+    val size = 44.dp
+    if (row.isGroup) {
+        GroupAvatar(photoHash = row.avatarHash, groupId = row.conversationId, faces = row.faces, size = size)
+    } else {
+        Avatar(
+            avatarHash = row.avatarHash,
+            name = row.title,
+            // A DM request's conversation id is the peer's node id.
+            nodeId = row.conversationId,
+            size = size,
+            contentDescription = stringResource(R.string.chat_view_profile, row.title),
+            onClick = onOpenProfile,
+        )
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+fun MessageRequestsScreenContentPreview() =
+    KnitPreview {
+        MessageRequestsScreenContent(
+            requests =
+                listOf(
+                    RequestRow(
+                        conversationId = "8f3a2b1c9d4e",
+                        title = "Stranger",
+                        avatarHash = null,
+                        isGroup = false,
+                        lastPreview = "hey, is this thing on?",
+                        lastMessageAt = 0L,
+                    ),
+                    RequestRow(
+                        conversationId = "g-abc123",
+                        title = "Hikers",
+                        avatarHash = null,
+                        isGroup = true,
+                        lastPreview = "Alice: welcome to the group!",
+                        lastMessageAt = 0L,
+                    ),
+                ),
+            onAccept = {},
+            onBlock = {},
+            onDelete = {},
+            onOpenProfile = {},
+            onBack = {},
+        )
+    }
+
+@Preview(showBackground = true)
+@Composable
+fun MessageRequestsScreenContentEmptyPreview() =
+    KnitPreview {
+        MessageRequestsScreenContent(
+            requests = emptyList(),
+            onAccept = {},
+            onBlock = {},
+            onDelete = {},
+            onOpenProfile = {},
+            onBack = {},
+        )
+    }

@@ -1,0 +1,292 @@
+[versions]
+agp = "9.4.1"
+coreKtx = "1.19.1"
+junit = "4.13.2"
+junitVersion = "1.3.0"
+# JVM-only mocking for the InboundPipeline seam test (relaxed mocks of the concrete Room-backed repos
+# the pipeline pulls in, so the test exercises the real DTN services + crypto without the full DB graph).
+mockk = "1.14.11"
+espressoCore = "3.7.0"
+# 2.11.0's lifecycle-viewmodel-compose AAR requires minCompileSdk=37 (lifecycle-runtime itself is only 34 —
+# when re-testing this group, check the *compose* artifacts, not the base one). compileSdk is 37.1, so it
+# fits; 2.12.0 is alpha.
+lifecycle = "2.11.0"
+activityCompose = "1.13.0"
+# The 2.10.x line is stable (2.9.8 was the hold-point before it). Its Android artifact is the KMP
+# `navigation-compose-android` AAR, minCompileSdk=37 / minAGP 9.1.0 — cleared by compileSdk 37.1 and
+# AGP 9.4.0. It declares androidx.compose.* 1.10.5 floors, well under the Compose BOM's 1.12.1.
+navigationCompose = "2.10.2"
+kotlin = "2.4.20"
+# Compose UI 1.12.1 / Material3 1.4.0. UI 1.12.1's AAR sets minCompileSdk=37, which compileSdk 37.1 clears.
+# 2026.09.00 is a pure Compose 1.12.0 → 1.12.1 patch — material3 and material-icons-extended are unmoved.
+composeBom = "2026.09.00"
+# KSP adopted independent (KSP2) versioning at 2.3.0 — no longer the old <kotlin>-<ksp> scheme. It is
+# decoupled from the compiler and supports Kotlin 2.2+, so this single version tracks Kotlin 2.4.x.
+ksp = "2.3.12"
+# Room 3 — a different group and package (`androidx.room3` / `androidx.room3:room3-*`), not a version bump of
+# `androidx.room`. It deletes the SupportSQLite layer from the core API, so `openHelperFactory` is gone and
+# `setDriver(SQLiteDriver)` is the only seam for a custom engine — which is why this waited on SQLCipher
+# 4.18.0's SQLCipherDriver. room3-runtime's AAR is minCompileSdk 34 / minAgp 8.1.1, well under our gate.
+# There is no `room3-ktx`: `withWriteTransaction` and friends live in room3-runtime.
+room3 = "3.0.3"
+# SQLCipher for Android: at-rest encryption for the Room DB. Native .so plus (since 4.18.0) a kotlin-stdlib
+# 2.2.10 floor — that direction is harmless, since a Kotlin 2.4 compiler reads 2.2 metadata fine; the hazard
+# is only the reverse (an older compiler reading Kotlin-2.4 metadata, which is what used to pin Coil). Its
+# other transitive dep is androidx.sqlite, which both it and Room 3 now put at **2.7.0** — 4.18.0 raised
+# SQLCipher's floor there, and room3-runtime asks for exactly the same, so the two agree and neither has to
+# win. sqlite 2.7.0's AAR is minCompileSdk 34, so it changes nothing about the SDK gate. Its .so are
+# 16 KB-page-aligned on all four ABIs (`readelf -lW` → LOAD align 0x4000), the same requirement that pins
+# litert to 1.4.x. 4.18.0 is also what supplies SQLCipherDriver, so Room 3 and SQLCipher move together.
+# 4.19.0 kept both deps and the alignment identical but raised its OWN aar-metadata minCompileSdk to 37;
+# 4.19.1 drops it back to 36 (upstream now compiles against 36) and adds the common-page-size linker flag —
+# still 0x4000 on all four ABIs.
+sqlcipher = "4.19.1"
+coroutines = "1.11.0"
+kotlinxSerializationJson = "1.11.0"
+# Alpha on purpose (the stable-only rule's second exception, toolchain.md): 1.3.0-alpha03 fixed the dropped
+# update a `data` collector that subscribes mid-write never sees (b/431787506, work item #97), which no stable
+# line carries — 1.2.1 postdates it and still has the race. Not alpha03-05: their libdatastore_shared_counter.so
+# ends RELRO mid-page inside its writable segment, so a 16 KB-page device runs the whole app in page-size compat
+# mode (pageSizeCompat=256) and shows the "isn't 16 KB compatible" warning; alpha06+ relinked it. Back to stable
+# once 1.3.0 ships. Pulls androidx.tracing 2.x, whose 1.x `Trace` / `trace {}` surface is unchanged.
+datastore = "1.3.0-alpha11"
+# The WSS client for the spool (Internet-relay) plane. Pure Java/Kotlin — no native code, so nothing to
+# 16 KB-align and nothing that can make the release build machine-dependent; its only non-stdlib
+# dependency is okio, already on the classpath via DataStore. Chosen over a Ktor client because its
+# WebSocket support is first-class on Android (it answers the daemon's 30 s pings automatically) and its
+# SOCKS Proxy support is the path to the deferred Tor toggle. Confined by rules/mesh.md (and detekt's
+# ForbiddenImport) to mesh/spool/OkHttpSpoolDialer.kt and linkpreview/OkHttpPreviewFetcher.kt — nothing
+# else in the app may import okhttp3.
+# NOTE the `okhttp` coordinate looks like a plain JVM jar but its Gradle module redirects an Android
+# consumer (`available-at`) to the okhttp-android AAR, so it is subject to that AAR's minCompileSdk —
+# 37 as of 5.5.0, which compileSdk 37.1 clears. Check okhttp-android, not okhttp, when bumping.
+okhttp = "5.5.0"
+koin = "4.2.2"
+# Coil 3.4.0+ is built with Kotlin 2.4.x. We now compile :app with Kotlin 2.4.20 (built-in Kotlin is
+# overridden off AGP's bundled 2.2.10 — see the buildscript classpath in the root build.gradle.kts), so
+# the 2.4 metadata is readable again and Coil is free to track latest.
+coil = "3.6.3"
+# On-device NSFW image classifier runtime — the classic TFLite interpreter, which upstream renamed to
+# "LiteRT". org.tensorflow:tensorflow-lite dead-ends at 2.17.0, whose x86_64/x86/armeabi-v7a .so segments
+# are only 4 KB-aligned (p_align=0x1000) and fail to load on a 16 KB-page image such as the emulator;
+# com.google.ai.edge.litert:litert 1.4.0+ re-links the SAME libtensorflowlite_jni.so 16 KB-aligned
+# (0x4000) across all four ABIs while keeping the identical org.tensorflow.lite.Interpreter API. The 1.4.x
+# line stays bare: depends only on litert-api (Java + native .so, no Kotlin metadata), pulls NO telemetry
+# (datatransport), NO Play model delivery (ai-delivery), declares no manifest permissions — so it can't
+# perturb the pinned Kotlin-2.4 graph or the app's offline-first, phones-home-never design. (The one
+# network dependency is okhttp below, and it only ever talks to spools the user configures themselves
+# and — with link previews switched on — to the sites behind links in the user's own messages.)
+# Do NOT jump to litert 2.x
+# (renames the lib to libLiteRt.so, drops x86, pulls ai-delivery + lifecycle + guava + coroutines +
+# FOREGROUND_SERVICE). Still deliberately chosen over com.google.mediapipe:tasks-vision.
+#noinspection GradleDependency
+litert = "1.4.2"
+# Google Tink: app-level E2E crypto (hybrid key-wrap, Ed25519 signatures, AES-GCM AEAD). Like SQLCipher
+# it is Java + native with no Kotlin metadata and no Gradle plugin, so it can't perturb the AGP /
+# Kotlin-2.4 toolchain. Works on minSdk 29 (the platform XDH/Ed25519 APIs are API 33+, which is why we
+# don't use java.security directly). 1.23.0 deprecated the two-arg TinkProtoKeysetFormat
+# parseKeyset/serializeKeyset overloads in favour of the RegistryConfiguration-taking ones — same wire
+# bytes, pure inlining; IdentityKeyStore already passes RegistryConfiguration.get() explicitly.
+tink = "1.23.0"
+# QR identity verification. zxing core is the pure-Java codec — it both *generates* the identity QR
+# (ui/image/QrCode.kt) and *decodes* camera frames (ui/scan/QrDecoder.kt). Being Android-free is what
+# keeps QrDecoder a plain-JVM unit-test target (see QrDecoderTest).
+#
+# The camera itself is CameraX. We do NOT use com.journeyapps:zxing-android-embedded: it was last
+# released Feb 2021, still drives the deprecated Camera1 API, and its decode loop runs on a bare
+# HandlerThread with no try/catch — a device whose camera HAL delivers a preview size/stride other than
+# the one it reported makes RawImageData.cropAndScale throw ArrayIndexOutOfBoundsException off the main
+# thread and kills the process. It has no seam to patch (BarcodeView.startDecoderThread is private).
+# See ADR 015. Constraints that pin CameraX to the 1.6.x line — check ALL of these before bumping:
+#   - minCompileSdk=36 (1.5.x is 35), comfortably under our compileSdk 37.1. 1.6.2 is the newest stable —
+#     1.7.x is alpha, which is what holds it here, not the SDK gate.
+#   - Its transitive floors are far below ours (lifecycle-livedata 2.3.1, core 1.3.2), so it applies no
+#     upgrade pressure to the pinned androidx graph.
+#   - camera-core ships prebuilt .so (libimage_processing_util_jni, libsurface_util_jni) for all four
+#     ABIs, 16 KB-page-aligned (LOAD align=0x4000) — the same requirement that pins litert to 1.4.x.
+#     Re-check with `readelf -lW` after any bump; a 4 KB-aligned .so won't load on 16 KB-page devices.
+#   - It ships its own consumer R8 rules, so keepRules/knit-r8.keep needs nothing for it.
+# NEVER add camera-mlkit-vision — it pulls GMS, which this app does not ship.
+cameraX = "1.6.2"
+zxingCore = "3.5.4"
+# On-device APK merge + re-sign for the offline "Share Knit app" flow when Knit was installed from Play
+# as an App Bundle (split APKs). ARSCLib merges the on-disk splits into one universal APK; apksig re-signs
+# it (the merge rewrites the manifest, which breaks the Play signature). Both are pure Java (no Kotlin
+# metadata, no Gradle plugin) — like SQLCipher/Tink/LiteRT above they're immune to the AGP-bundled-Kotlin
+# metadata constraint and can't perturb the toolchain. ARSCLib has zero transitive deps; apksig resolves
+# from google() and also has none. apksig tracks the AGP/build-tools line — keep it equal to `agp` above;
+# its default signer 16 KB-page-aligns uncompressed lib/*.so, matching the app's own 16 KB alignment
+# requirement (see litert).
+arsclib = "1.4.0"
+apksig = "9.4.1"
+# detekt static analysis, applied as the `dev.detekt` Gradle plugin (see [plugins] below). 2.0.0-alpha.x
+# is the first detekt line that supports Gradle 9 — 1.23.x caps at Gradle 8.12.1, and this build is on
+# 9.7.0 — and it ships the new `dev.detekt` plugin/group id (was io.gitlab.arturbosch.detekt). Runs in its
+# own isolated task classpath, so it doesn't touch :app's compile/runtime graph. Keep the CI `verify:detekt`
+# job (now `./gradlew detekt`) on this same version.
+detekt = "2.0.0-alpha.6"
+# ktlint (Kotlin style/format lint), applied via the org.jlleitschuh.gradle.ktlint plugin (ktlintPlugin
+# below). This `ktlint` version is the underlying ktlint *tool* version the plugin runs — pinned in
+# app/build.gradle.kts via `ktlint { version.set(...) }` so rule behavior stays fixed independent of the
+# plugin bump. `./gradlew ktlintFormat` now autocorrects; `./gradlew ktlintCheck` verifies.
+ktlint = "1.8.0"
+# org.jlleitschuh.gradle.ktlint plugin version — 14.x supports Gradle 9.1+ and the configuration cache.
+ktlintPlugin = "14.2.0"
+# Kover — Kotlin test-coverage. This is the ONE tooling Gradle plugin we apply (detekt/ktlint run as
+# standalone CLIs off the build classpath — see above). The difference is fundamental: detekt/ktlint are
+# source analyzers, but coverage MUST instrument bytecode and hook test execution, which only the plugin
+# does cleanly (a CLI would have to swap offline-instrumented classes into AGP's unit-test task). It's
+# lower-risk than Hilt's plugin was: it hooks testDebugUnitTest *post-compile* (no compile-time codegen)
+# and only adds Java-only agent/offline-runtime jars to test-scope configurations, so it can't perturb the
+# pinned Kotlin-2.4 metadata graph on :app's compile/runtime classpath. Applied to :app only. 0.9.1 (the
+# 0.9 line's Gradle-9 fix) applied but did NOT hook AGP 9.2.1's variants (no per-variant tasks, empty
+# report); 0.9.8+ detects the debug variant correctly, so don't drop below it. Run with
+# `./gradlew :app:koverHtmlReportDebug` (HTML) / `:app:koverXmlReportDebug` (CI-parseable XML).
+kover = "0.9.11"
+# JVM Room/DAO + migration tests (finding #5): Robolectric supplies a Context + framework SQLite on the JVM
+# so in-memory Room executes the real eviction/GC SQL, and MigrationTestHelper (room-testing) rebuilds the
+# exported schema via androidx.sqlite's AndroidSQLiteDriver on that same shadowed SQLite (BundledSQLiteDriver
+# can't load its Android native lib on the host JVM). androidx.test:core provides ApplicationProvider.
+# Robolectric 4.17 is the first release supporting SDK 37 (4.16 was the first with SDK 36) and requires
+# JDK 21 (this repo's toolchain). Its breaking changes — `AndroidVersions` removed in favour of the
+# android.os.Build constants, and ShadowCameraCharacteristics.set(Key, Object) → set(Key, T) — touch
+# nothing here; neither symbol appears in app/src.
+robolectric = "4.17"
+# Compose Preview Screenshot Testing (`com.android.compose.screenshot`): renders `@PreviewTest` previews from
+# `app/src/screenshotTest/` through layoutlib on the host JVM and diffs them against committed reference PNGs.
+# A standing exception to the stable-only rule (context/toolchain.md): the plugin has never shipped a stable
+# release. alpha12 is the first with AGP 9, alpha15 the first that renders under Kotlin 2.1+ (it was missing
+# kotlin-stdlib). Plugin and validation API share one version. Test-only: nothing reaches :app's runtime
+# classpath, and the release APK is byte-identical with the plugin applied.
+composeScreenshot = "0.0.1-alpha16"
+androidxTestCore = "1.7.0"
+# Android Test Orchestrator (instrumentation isolation for Firebase Test Lab): each test runs in its own
+# process with `clearPackageData` wiping app data between tests. The orchestrator/test-services pair is a
+# separate 1.6.x train from core/runner/rules (all 1.7.0); orchestrator 1.6.1's POM depends on
+# test-services 1.6.0 (the lockfile already carries androidx.test.services:storage:1.6.0). These are only
+# needed for LOCAL `connectedDebugAndroidTest` parity — FTL injects its own orchestrator via
+# `--use-orchestrator` and reads `clearPackageData` from `--environment-variables`.
+androidxTestOrchestrator = "1.6.1"
+androidxTestServices = "1.6.0"
+# UIAutomator: the black-box driver for the app.getknit.knit.uiauto suite (system shade, process
+# lifecycle, real-field input). testTagsAsResourceId (KnitApp NavHost) surfaces every Compose testTag as
+# a resource-id, so By.res(...) matches the same tags the Compose suite asserts on. 2.4.0 went stable and
+# adds a new Kotlin DSL alongside the classic UiDevice/By/Until API this suite uses (unchanged); its AAR is
+# minCompileSdk=34, well under our 36.1. androidTest-only, no APK/runtime impact on the app.
+uiautomator = "2.4.0"
+# androidx ExifInterface — reads the orientation tag off user-picked photos (ImageDecode). Preferred over
+# the platform android.media.ExifInterface (which AndroidLintExifInterface flags): the androidx one carries
+# the format support and bug fixes the platform class only gains with each OS release, which matters on
+# minSdk 29 for the HEIC/RAW files a modern camera hands us through the picker.
+exifinterface = "1.4.2"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-exifinterface = { group = "androidx.exifinterface", name = "exifinterface", version.ref = "exifinterface" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+androidx-lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-lifecycle-service = { group = "androidx.lifecycle", name = "lifecycle-service", version.ref = "lifecycle" }
+androidx-lifecycle-process = { group = "androidx.lifecycle", name = "lifecycle-process", version.ref = "lifecycle" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigationCompose" }
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-compose-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-compose-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-manifest" }
+androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
+# ATF (Accessibility Test Framework) checks in Compose UI tests — the same framework the Play pre-launch
+# report runs. BOM-governed like the other compose-ui test artifacts. See app.getknit.knit.a11y.
+androidx-compose-ui-test-junit4-accessibility = { group = "androidx.compose.ui", name = "ui-test-junit4-accessibility" }
+androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
+
+androidx-room-runtime = { group = "androidx.room3", name = "room3-runtime", version.ref = "room3" }
+androidx-room-compiler = { group = "androidx.room3", name = "room3-compiler", version.ref = "room3" }
+androidx-room-testing = { group = "androidx.room3", name = "room3-testing", version.ref = "room3" }
+mockk = { group = "io.mockk", name = "mockk", version.ref = "mockk" }
+
+# JVM Room/DAO + migration test deps (finding #5) — see the [versions] notes above.
+robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
+androidx-test-core = { group = "androidx.test", name = "core", version.ref = "androidxTestCore" }
+# `@PreviewTest` for the screenshot-test source set — see the composeScreenshot version note above.
+compose-screenshot-validation-api = { group = "com.android.tools.screenshot", name = "screenshot-validation-api", version.ref = "composeScreenshot" }
+# Instrumentation runner/rules (promote the transitive runner to explicit; rules gives GrantPermissionRule
+# / ActivityScenario helpers) + the Orchestrator and its test-services APK (androidTestUtil). See the
+# version notes above.
+androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestCore" }
+androidx-test-rules = { group = "androidx.test", name = "rules", version.ref = "androidxTestCore" }
+androidx-test-orchestrator = { group = "androidx.test", name = "orchestrator", version.ref = "androidxTestOrchestrator" }
+androidx-test-services = { group = "androidx.test.services", name = "test-services", version.ref = "androidxTestServices" }
+# Scoped-storage-safe test output (TestStorage) — how screenshots reach Firebase Test Lab's collected
+# per-device outputs without WRITE_EXTERNAL_STORAGE on any API level (the doc's no-permission promise, kept
+# on the emulator too — unlike testlab-instr-lib, which hardcodes a /sdcard write only FTL's env grants).
+androidx-test-services-storage = { group = "androidx.test.services", name = "storage", version.ref = "androidxTestServices" }
+# UIAutomator black-box driver (androidTest-only; app.getknit.knit.uiauto suite). See the version note above.
+androidx-test-uiautomator = { group = "androidx.test.uiautomator", name = "uiautomator", version.ref = "uiautomator" }
+androidx-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
+
+sqlcipher-android = { group = "net.zetetic", name = "sqlcipher-android", version.ref = "sqlcipher" }
+
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+# Test-only: a local HTTP server for OkHttpPreviewFetcherTest — the byte caps, redirect policy and header
+# hygiene of the link-preview fetch are only observable on a socket. Same version line as okhttp, never ships.
+okhttp-mockwebserver = { group = "com.squareup.okhttp3", name = "mockwebserver3", version.ref = "okhttp" }
+
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
+kotlinx-serialization-cbor = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-cbor", version.ref = "kotlinxSerializationJson" }
+
+koin-android = { group = "io.insert-koin", name = "koin-android", version.ref = "koin" }
+koin-androidx-compose = { group = "io.insert-koin", name = "koin-androidx-compose", version.ref = "koin" }
+koin-test-junit4 = { group = "io.insert-koin", name = "koin-test-junit4", version.ref = "koin" }
+
+coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
+coil-gif = { group = "io.coil-kt.coil3", name = "coil-gif", version.ref = "coil" }
+
+litert = { group = "com.google.ai.edge.litert", name = "litert", version.ref = "litert" }
+tink-android = { group = "com.google.crypto.tink", name = "tink-android", version.ref = "tink" }
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
+
+# CameraX: the QR identity scanner's camera stack (see the cameraX version pin for the constraints).
+androidx-camera-core = { group = "androidx.camera", name = "camera-core", version.ref = "cameraX" }
+androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "cameraX" }
+androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraX" }
+androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraX" }
+
+# Offline "Share Knit app": merge on-device split (Play App Bundle) APKs into one universal APK (ARSCLib,
+# Maven Central) and re-sign it (apksig, google()). See the version notes above.
+reandroid-arsclib = { group = "io.github.reandroid", name = "ARSCLib", version.ref = "arsclib" }
+apksig = { group = "com.android.tools.build", name = "apksig", version.ref = "apksig" }
+
+# Put onto the root buildscript classpath so AGP 9's built-in Kotlin compiles with this KGP (2.4.20)
+# instead of AGP's bundled default (2.2.10). Kotlin 2.4 is supported on AGP 9.1+ per Google's
+# AGP↔Kotlin matrix; this is what lets us read Coil 3.4+/latest Compose's Kotlin-2.4 metadata.
+kotlin-gradle-plugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+# Test coverage — hooks test execution to instrument bytecode. Applied on :app in app/build.gradle.kts.
+kover = { id = "org.jetbrains.kotlinx.kover", version.ref = "kover" }
+# Static analysis (dev.detekt). Applied on :app; analyzes src/main/java + src/test/java without type
+# resolution (matching the old CLI). See the `detekt` version note above for the Gradle-9 requirement.
+detekt = { id = "dev.detekt", version.ref = "detekt" }
+# Kotlin style/format lint. Applied on the root project (lints the *.gradle.kts scripts) and on :app
+# (lints app/src Kotlin). `ktlintCheck` verifies, `ktlintFormat` autocorrects.
+ktlint = { id = "org.jlleitschuh.gradle.ktlint", version.ref = "ktlintPlugin" }
+# Room schema export — replaces the raw `ksp { arg("room.schemaLocation", …) }`. Applied on :app; the
+# schema dir is set via `room3 { schemaDirectory(…) }` — the Room 3 plugin's extension is `room3`, not
+# `room`. Its id is `androidx.room3`; versioned with room3 (3.0.3).
+androidx-room = { id = "androidx.room3", version.ref = "room3" }
+# Compose Preview Screenshot Testing — `updateDebugScreenshotTest` / `validateDebugScreenshotTest`. Applied on
+# :app; see the composeScreenshot version note above and .agents/context/testing.md.
+compose-screenshot = { id = "com.android.compose.screenshot", version.ref = "composeScreenshot" }

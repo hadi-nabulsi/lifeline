@@ -1,0 +1,169 @@
+package app.getknit.knit.ui.chat
+
+import androidx.annotation.StringRes
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
+import app.getknit.knit.R
+import app.getknit.knit.data.message.DeliveryPlane
+import app.getknit.knit.data.message.MessageEntity
+
+/**
+ * How far one of *our* messages has got, folded out of the three independent columns that record it:
+ * [MessageEntity.pendingKey] (saved locally, never sealed — we don't hold the recipient's key yet),
+ * [MessageEntity.received] (a delivery receipt came back), and nothing at all in between.
+ *
+ * A received message has no status of its own — delivery isn't ours to report — so [deliveryLabel]
+ * takes `mine` and describes *arrival* instead for the other direction.
+ */
+enum class DeliveryStatus {
+    /** Written locally but never sent: the recipient's public key hasn't reached us yet. */
+    Pending,
+
+    /** Flooded, no receipt back yet (or a broadcast/group send, which never gets one). */
+    Sent,
+
+    /** A delivery receipt came back. */
+    Delivered,
+
+    ;
+
+    companion object {
+        /** The status the stored row implies. Order matters: `pendingKey` outranks the (always false) tick. */
+        fun of(message: MessageEntity): DeliveryStatus =
+            when {
+                message.pendingKey -> Pending
+                message.received -> Delivered
+                else -> Sent
+            }
+    }
+}
+
+/**
+ * A resolved delivery line: the string resource plus any format arguments it takes. A plain `@StringRes`
+ * no longer suffices now that the group form carries a count, and keeping the arguments beside the id (
+ * rather than formatting here) leaves [deliveryLabel] a pure function the JVM tests can assert on
+ * directly. Format it with [resolve].
+ */
+data class DeliveryText(
+    @param:StringRes val resId: Int,
+    val args: List<Any> = emptyList(),
+)
+
+/** Formats a [DeliveryText] against the current resources. */
+@Composable
+fun DeliveryText.resolve(): String = stringResource(resId, *args.toTypedArray())
+
+/**
+ * The user-facing line for a message's delivery [status] on [plane]. The single definition shared by the
+ * chat bubble's tick (an accessibility description — the tick itself is icon-only), the chat-list row, and
+ * the message-details screen (where it is visible text), so the three can't drift apart.
+ *
+ * The plane only qualifies a delivery that actually happened: a [DeliveryStatus.Sent] message has no
+ * receipt yet, so there is no plane to name. For an inbound message the frame's own arrival plane is the
+ * evidence ([MessageEntity.receivedVia]); the Internet and LoRa planes are named, and every phone radio
+ * reads as "nearby" — see [DeliveryPlane].
+ *
+ * [delivered]/[total] are the per-recipient counts for a **group** message we sent (`message_receipts`
+ * against the effective roster, ADR 036). Given both, the line reports the ratio instead of a bare
+ * "Delivered", because the tick itself cannot: `received` flips on the *first* member's ack, so ✓✓ means
+ * "at least one", and on a group that is exactly the thing worth being precise about. Three rules keep it
+ * honest:
+ *
+ * - **A zero count is not reported.** A message acked before this device recorded ackers is ticked with no
+ *   rows at all; "Delivered to 0 of 3" would contradict its own tick. It falls back to plain "Delivered",
+ *   the same "predates the table" rule the details screen's split uses.
+ * - **The count outranks the plane.** A group's stored plane is first-evidence-wins across the whole
+ *   roster, so naming it would describe whichever member happened to ack first — the ratio is the more
+ *   useful of the two, and saying both is a mouthful in a tick description.
+ * - **Absent counts change nothing.** Callers with no roster to hand (the chat list, every DM and
+ *   broadcast message) omit them and get exactly today's wording.
+ */
+fun deliveryLabel(
+    status: DeliveryStatus,
+    plane: DeliveryPlane,
+    mine: Boolean,
+    delivered: Int? = null,
+    total: Int? = null,
+): DeliveryText =
+    when {
+        !mine -> {
+            arrivalText(plane)
+        }
+
+        status == DeliveryStatus.Pending -> {
+            DeliveryText(R.string.chat_status_pending_key)
+        }
+
+        status == DeliveryStatus.Delivered && delivered != null && delivered > 0 && total != null && total > 0 -> {
+            DeliveryText(R.string.chat_status_delivered_count, listOf(delivered, total))
+        }
+
+        status == DeliveryStatus.Delivered -> {
+            deliveredText(plane)
+        }
+
+        else -> {
+            DeliveryText(R.string.chat_status_sent)
+        }
+    }
+
+/** How a message we received got here — the plane is named only when it is worth a word. */
+private fun arrivalText(plane: DeliveryPlane): DeliveryText =
+    DeliveryText(
+        when (plane) {
+            DeliveryPlane.Internet -> R.string.chat_status_arrived_internet
+            DeliveryPlane.LoRa -> R.string.chat_status_arrived_lora
+            else -> R.string.chat_status_arrived_nearby
+        },
+    )
+
+/** How our acked message got there, by the plane its first receipt crossed. */
+private fun deliveredText(plane: DeliveryPlane): DeliveryText =
+    DeliveryText(
+        when (plane) {
+            DeliveryPlane.Internet -> R.string.chat_status_delivered_internet
+            DeliveryPlane.LoRa -> R.string.chat_status_delivered_lora
+            else -> R.string.chat_status_delivered
+        },
+    )
+
+/**
+ * The glyph that says which plane carried a message — painted ahead of the ✓✓ on our acked sends and on
+ * its own on an arrival: a globe for the Internet plane, the radio-waves mark for LoRa, and nothing for a
+ * phone radio (the plain case needs no ornament). Pair it with [deliveryLabel] — the glyph never carries
+ * the words; [planeTag] names its test tag.
+ */
+fun planeGlyph(plane: DeliveryPlane): ImageVector? =
+    when (plane) {
+        DeliveryPlane.Internet -> Icons.Filled.Public
+        DeliveryPlane.LoRa -> Icons.Filled.Sensors
+        else -> null
+    }
+
+/** The test-tag suffix of [plane]'s glyph (`chat_tick_<tag>` / `chat_arrived_<tag>`); null when it paints none. */
+fun planeTag(plane: DeliveryPlane): String? =
+    when (plane) {
+        DeliveryPlane.Internet -> "relay"
+        DeliveryPlane.LoRa -> "lora"
+        else -> null
+    }
+
+/**
+ * The tick glyph for one of *our* messages at [status]: a clock while it can't be sent yet, one check once
+ * it's flooded, two once a receipt is back. The single definition shared by the chat-list row and the
+ * message-details screen, so the two can't drift apart. Pair it with [deliveryLabel] for the words —
+ * the glyph alone never carries the meaning.
+ */
+fun deliveryIcon(status: DeliveryStatus): ImageVector =
+    when (status) {
+        DeliveryStatus.Pending -> Icons.Filled.Schedule
+        DeliveryStatus.Sent -> Icons.Filled.Done
+        DeliveryStatus.Delivered -> Icons.Filled.DoneAll
+    }

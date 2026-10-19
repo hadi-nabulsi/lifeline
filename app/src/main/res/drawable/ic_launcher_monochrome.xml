@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Monochrome (themed-icon) layer for the launcher icon, API 33+.
+
+  This is the Lifeline mark as a POSITIVE silhouette, in four primitives drawn in the
+  source artwork's own 1024-unit space (see ic_launcher-playstore.png):
+
+    1. a 113-wide round-capped stroke down the left, node centre to node centre: it
+       stands in for the top node, the link, the vertical bar, the link below it and the
+       bottom-left node all at once, because their union is exactly that stroke;
+    2. the same stroke to the right, covering the horizontal bar and the right node;
+    3. the 27-wide diagonal link;
+    4. the smaller middle node as a disc.
+
+  Painting strokes rather than one filled outline is what keeps this honest: the
+  union is exact by construction, so no fill rule can punch a hole where two bars
+  cross. The notification status icon and Nearby room glyph use this same positive mark
+  in their own 24dp viewport.
+
+  The group transform maps the source's 1024 square onto the 72dp visible area of the
+  108dp adaptive-icon canvas — the same mapping the raster foreground layer uses — so
+  the themed icon registers with the normal icon instead of drifting. The mark's
+  furthest point from centre lands 28.8dp out, inside the 66dp safe zone.
+
+  No android:tint — the launcher supplies the tint for monochrome layers.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+  <group
+      android:scaleX="0.0703125"
+      android:scaleY="0.0703125"
+      android:translateX="18.0352"
+      android:translateY="18.0352">
+    <path
+        android:pathData="M312,248 L312,775"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="113"
+        android:strokeLineCap="round"/>
+    <path
+        android:pathData="M312,775 L711,775"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="113"
+        android:strokeLineCap="round"/>
+    <path
+        android:pathData="M312,775 L437.5,648"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="27"
+        android:strokeLineCap="round"/>
+    <path
+        android:pathData="M391,648 a46.5,46.5 0 1,1 93,0 a46.5,46.5 0 1,1 -93,0 Z"
+        android:fillColor="#FFFFFF"/>
+  </group>
+</vector>

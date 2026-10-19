@@ -1,0 +1,712 @@
+package app.getknit.knit.notifications
+
+import android.Manifest
+import android.app.Notification
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Typeface
+import android.os.Build
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.format.Formatter
+import android.text.style.StyleSpan
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.Person
+import androidx.core.app.RemoteInput
+import androidx.core.content.ContextCompat
+import androidx.core.content.LocusIdCompat
+import androidx.core.graphics.drawable.IconCompat
+import app.getknit.knit.MainActivity
+import app.getknit.knit.R
+import app.getknit.knit.data.message.ConversationKind
+import app.getknit.knit.data.message.Conversations
+
+/**
+ * Builds and posts "new message" notifications, Signal-style: **one MessagingStyle notification per
+ * conversation** (real title + group/peer avatar as the large icon, per-sender lines, and inline
+ * **Reply** + **Mark read** actions), all stacked under a single **group summary** ("N messages in M
+ * chats"). Each conversation keeps its own in-memory [NotificationHistory] and re-posts under a stable
+ * tag ([NotificationManagerCompat.notify] with `tag`=conversation, a shared id), so a busy thread updates
+ * its one notification instead of buzzing repeatedly ([NotificationCompat.Builder.setOnlyAlertOnce]).
+ * Tapping a notification deep-links straight to that thread (see [openChatIntent] / [MainActivity]).
+ * Channels themselves are owned by [NotificationChannels].
+ *
+ * Mentions post as a **separate** entry (tag `mention:<conversationId>`) on the Mentions channel — still
+ * grouped under the same summary — so a thread that both @-mentions you and sends normal messages shows
+ * both, matching the app's dedicated-mentions design.
+ *
+ * Suppression is per-conversation: while a conversation is on screen ([setVisibleConversation]) its
+ * messages are not notified, and opening it clears its already-posted notification(s). A Koin process
+ * singleton; lives as long as MeshService keeps the process alive.
+ */
+class MessageNotifier internal constructor(
+    private val context: Context,
+    // The conversation shortcuts every notification names (`setShortcutId`), and the avatar painter they share.
+    private val shortcuts: ConversationShortcuts,
+) : Notifier {
+    private val manager = NotificationManagerCompat.from(context)
+
+    /** Every bitmap a notification shows — decoded photos and the generated fallbacks — lives in here. */
+    private val avatars get() = shortcuts.avatars
+
+    /** The conversation currently on screen, or null when none is. */
+    @Volatile
+    private var visibleConversationId: String? = null
+
+    /** Whether the Message Requests inbox is on screen (suppresses the coalesced request heads-up). */
+    @Volatile
+    private var requestsVisible = false
+
+    /** Last "me" identity seen on a post, so a Mark-read-driven summary refresh can rebuild. */
+    @Volatile
+    private var lastSelf: Self? = null
+
+    private class Self(
+        val id: String,
+        val name: String,
+        val avatarBytes: ByteArray?,
+    )
+
+    /** Per-conversation accumulated state, keyed by notification tag (conversationId or `mention:…`). */
+    private class ConvState(
+        val tag: String,
+        val conversationId: String,
+        val isMention: Boolean,
+    ) {
+        val history = NotificationHistory()
+
+        /** Count of *incoming* messages since last clear (own inline replies don't count) — summary line. */
+        var count = 0
+        var kind: ConversationKind = ConversationKind.DM
+        var title: String? = null
+        var avatarBytes: ByteArray? = null
+
+        /** A photo-less group's cluster; kept here so an inline reply's re-render draws it too. */
+        var faces: List<NotifFace> = emptyList()
+
+        /** The [ConversationShortcuts.stamp] of the latest post or refresh, so a shortcut pass never acts on a newer one. */
+        var stamp = 0L
+    }
+
+    /** Immutable snapshot of a [ConvState] captured under the lock, so building/posting stays lock-free. */
+    private class Render(
+        val tag: String,
+        val conversationId: String,
+        val kind: ConversationKind,
+        val isMention: Boolean,
+        val title: String?,
+        val avatarBytes: ByteArray?,
+        val faces: List<NotifFace>,
+        val messages: List<NotifMessage>,
+    )
+
+    /** Guards [states]; every mutation + snapshot happens under it. */
+    private val states = LinkedHashMap<String, ConvState>()
+
+    override fun createChannel() = NotificationChannels.ensure(context)
+
+    override fun notify(
+        incoming: NotifMessage,
+        conversation: NotifConversation,
+        selfId: String,
+        selfName: String,
+        selfAvatarBytes: ByteArray?,
+    ) = post(conversation, isMention = false, incoming, selfId, selfName, selfAvatarBytes)
+
+    override fun notifyMention(
+        incoming: NotifMessage,
+        conversation: NotifConversation,
+        selfId: String,
+        selfName: String,
+        selfAvatarBytes: ByteArray?,
+    ) = post(conversation, isMention = true, incoming, selfId, selfName, selfAvatarBytes)
+
+    /** Records [incoming] in its conversation's state and (re)posts that notification + the group summary. */
+    private fun post(
+        conversation: NotifConversation,
+        isMention: Boolean,
+        incoming: NotifMessage,
+        selfId: String,
+        selfName: String,
+        selfAvatarBytes: ByteArray?,
+    ) {
+        // The user is already looking at this conversation — nothing to surface.
+        if (incoming.conversationId == visibleConversationId) return
+        val self = Self(selfId, selfName, selfAvatarBytes).also { lastSelf = it }
+        val tag = tagFor(conversation.conversationId, isMention)
+        val render =
+            synchronized(states) {
+                val state = states.getOrPut(tag) { ConvState(tag, conversation.conversationId, isMention) }
+                state.kind = conversation.kind
+                state.title = conversation.title
+                state.avatarBytes = conversation.avatarBytes
+                state.faces = conversation.faces
+                state.stamp = shortcuts.stamp()
+                state.count += 1
+                renderOf(state, state.history.add(incoming))
+            }
+        buildAndPost(render, self)
+        postSummary()
+    }
+
+    override fun onReplied(
+        notificationTag: String,
+        text: String,
+        selfId: String,
+        selfName: String,
+        selfAvatarBytes: ByteArray?,
+    ) {
+        val self = Self(selfId, selfName, selfAvatarBytes).also { lastSelf = it }
+        val render =
+            synchronized(states) {
+                val state = states[notificationTag] ?: return@synchronized null
+                // Echo the sent reply as an outgoing line (senderId == self ⇒ renders as "You"). Not counted
+                // toward the summary — it's our own message, and we don't re-alert (setOnlyAlertOnce). A blank
+                // reply adds nothing; we still re-post the existing state to clear the "sending…" spinner.
+                val messages =
+                    if (text.isBlank()) {
+                        state.history.snapshot()
+                    } else {
+                        val echo =
+                            NotifMessage(
+                                senderId = selfId,
+                                senderName = selfName,
+                                body = text,
+                                sentAt = System.currentTimeMillis(),
+                                conversationId = state.conversationId,
+                                avatarBytes = selfAvatarBytes,
+                            )
+                        state.history.add(echo)
+                    }
+                renderOf(state, messages)
+            }
+        if (render == null) {
+            // State gone (e.g. process restarted since the notification was shown) — clear the reply spinner.
+            runCatching { manager.cancel(notificationTag, ID_MESSAGE) }
+            return
+        }
+        buildAndPost(render, self)
+        postSummary()
+    }
+
+    override fun setVisibleConversation(conversationId: String?) {
+        visibleConversationId = conversationId
+        // Leaving a chat (null) just resumes notifying; opening one clears what it already showed
+        // (both its normal and mention entries).
+        if (conversationId != null) clearConversation(conversationId)
+        // The open-to-chat cue points at the Nearby room: opening the room by hand is the cue taken.
+        if (conversationId == Conversations.NEARBY) runCatching { manager.cancel(ID_OPEN_TO_CHAT) }
+    }
+
+    override fun notifyOpenToChat(
+        names: List<String>,
+        avatarBytes: ByteArray?,
+    ) {
+        // Already in the room the cue points at: nothing to say. (The policy still counts the peers as
+        // named — the cue was moot, not missed.)
+        if (names.isEmpty() || visibleConversationId == Conversations.NEARBY) {
+            runCatching { manager.cancel(ID_OPEN_TO_CHAT) }
+            return
+        }
+        val single = names.size == 1
+        val (shown, others) = openToChatNames(names)
+        val title =
+            if (single) {
+                context.getString(R.string.notif_open_to_chat_title_one, names[0])
+            } else {
+                context.resources.getQuantityString(R.plurals.notif_open_to_chat_title, names.size, names.size)
+            }
+        val text =
+            when {
+                single -> {
+                    context.getString(R.string.notif_open_to_chat_body_one)
+                }
+
+                others == 0 -> {
+                    context.getString(R.string.notif_open_to_chat_names_two, shown[0], shown[1])
+                }
+
+                else -> {
+                    context.resources.getQuantityString(
+                        R.plurals.notif_open_to_chat_names_more,
+                        others,
+                        shown.joinToString(", "),
+                        others,
+                    )
+                }
+            }
+        // One person: their face (keyed on the name for the letter fallback — no identity reaches here);
+        // several: the room the cue points at.
+        val largeIcon = if (single) avatars.bitmapFor(avatarBytes) ?: avatars.letterAvatar(names[0], names[0]) else avatars.roomAvatar()
+        val notification =
+            NotificationCompat
+                .Builder(context, NotificationChannels.OPEN_TO_CHAT)
+                .setSmallIcon(R.drawable.ic_stat_mesh)
+                .setLargeIcon(largeIcon)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setCategory(NotificationCompat.CATEGORY_SOCIAL)
+                .setContentIntent(openChatIntent(TAG_OPEN_TO_CHAT, Conversations.NEARBY))
+                .setAutoCancel(true)
+                // Every post is a genuine cue — the policy spaces them — so a re-post alerts again.
+                .setOnlyAlertOnce(false)
+                .build()
+        postNotification(null, ID_OPEN_TO_CHAT, notification)
+    }
+
+    override fun notifyTransferOffer(
+        peerId: String,
+        peerName: String,
+        peerAvatarBytes: ByteArray?,
+        fileName: String,
+        sizeBytes: Long?,
+    ) {
+        // Reading the thread already: the card is on screen with Accept and Decline on it.
+        if (peerId == visibleConversationId) return
+        val size = sizeBytes?.takeIf { it > 0 }?.let { Formatter.formatShortFileSize(context, it) }
+        val text =
+            if (size == null) {
+                context.getString(R.string.notif_transfer_offer, fileName)
+            } else {
+                context.getString(R.string.notif_transfer_offer_sized, fileName, size)
+            }
+        val tag = transferTagFor(peerId)
+        val notification =
+            NotificationCompat
+                .Builder(context, NotificationChannels.DMS)
+                // The feature's own mark, which is the whole reason this is not a line in the thread.
+                .setSmallIcon(R.drawable.ic_direct_transfer)
+                .setLargeIcon(avatars.bitmapFor(peerAvatarBytes) ?: avatars.letterAvatar(peerName, peerId))
+                .setContentTitle(peerName)
+                .setContentText(text)
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setContentIntent(openChatIntent(tag, peerId))
+                .setAutoCancel(true)
+                // Standalone, not in the messages group: an offer expires in three minutes and is worth
+                // answering on its own, not folded into "N messages in M chats".
+                .setOnlyAlertOnce(false)
+                .build()
+        postNotification(tag, ID_TRANSFER, notification)
+    }
+
+    override fun clearOpenToChat() {
+        runCatching { manager.cancel(ID_OPEN_TO_CHAT) }
+    }
+
+    override fun clearConversation(conversationId: String) {
+        listOf(tagFor(conversationId, false), tagFor(conversationId, true)).forEach { tag ->
+            synchronized(states) { states.remove(tag) }
+            runCatching { manager.cancel(tag, ID_MESSAGE) }
+        }
+        // The offer heads-up belongs to the same thread and goes when it does — opening the chat puts the
+        // card itself in front of the user, which is more than the notification was offering.
+        runCatching { manager.cancel(transferTagFor(conversationId), ID_TRANSFER) }
+        postSummary()
+    }
+
+    override fun forgetConversation(conversationId: String) {
+        clearConversation(conversationId)
+        // The shortcut is keyed by the conversation id: removing the long-lived one takes the dynamic entry and the
+        // system's cached copy with it, and a copy pinned to the home screen is disabled (ADR 2026-10.jbsa).
+        shortcuts.forget(listOf(conversationId))
+    }
+
+    override fun retainConversations(
+        offered: Set<String>,
+        refreshed: Map<String, NotifConversation>,
+        since: Long,
+    ) {
+        val cleared = ArrayList<String>()
+        synchronized(states) {
+            // A post after the pass read its inputs is newer than anything the pass knows: it stays as posted.
+            for (state in states.values.filter { it.stamp <= since }) {
+                val face = refreshed[state.conversationId]
+                if (state.conversationId !in offered) {
+                    cleared += state.conversationId
+                } else if (face != null) {
+                    // What the next re-render (an inline reply's echo, a Mark read) draws; the posted notification
+                    // keeps its face until then — re-posting it for a new photo would be a post the user did not cause.
+                    state.title = face.title
+                    state.avatarBytes = face.avatarBytes
+                    state.faces = face.faces
+                }
+            }
+        }
+        // Cancelled outside the lock, as Mark read does: a gone conversation's lines would offer a Reply to a thread
+        // that is no longer there.
+        cleared.distinct().forEach(::clearConversation)
+    }
+
+    override fun onDismissed(tag: String) {
+        if (tag == DISMISS_ALL) {
+            synchronized(states) { states.clear() }
+            runCatching { manager.cancel(ID_SUMMARY) }
+            return
+        }
+        synchronized(states) { states.remove(tag) }
+        postSummary()
+    }
+
+    override fun notifyMessageRequests(count: Int) {
+        // Coalesced: one HIGH-importance heads-up, refreshed in place. A Sybil flood only updates the
+        // count, never re-alerts (setOnlyAlertOnce). count <= 0 — or the inbox being on screen — cancels it.
+        if (count <= 0 || requestsVisible) {
+            runCatching { manager.cancel(ID_REQUESTS) }
+            return
+        }
+        val notification =
+            NotificationCompat
+                .Builder(context, NotificationChannels.REQUESTS)
+                .setSmallIcon(R.drawable.ic_stat_mesh)
+                .setContentTitle(context.getString(R.string.notif_requests_title))
+                .setContentText(context.resources.getQuantityString(R.plurals.notif_requests_body, count, count))
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setContentIntent(openRequestsIntent())
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .build()
+        postNotification(null, ID_REQUESTS, notification)
+    }
+
+    override fun setRequestsVisible(visible: Boolean) {
+        requestsVisible = visible
+        // Opening the inbox clears any already-posted heads-up (the user is looking at the list).
+        if (visible) runCatching { manager.cancel(ID_REQUESTS) }
+    }
+
+    /** Snapshots the mutable [state] into an immutable [Render] (call under the [states] lock). */
+    private fun renderOf(
+        state: ConvState,
+        messages: List<NotifMessage>,
+    ) = Render(
+        tag = state.tag,
+        conversationId = state.conversationId,
+        kind = state.kind,
+        isMention = state.isMention,
+        title = state.title,
+        avatarBytes = state.avatarBytes,
+        faces = state.faces,
+        messages = messages,
+    )
+
+    /** Builds a MessagingStyle notification for one conversation and posts it under its tag. */
+    private fun buildAndPost(
+        r: Render,
+        self: Self,
+    ) {
+        if (!canPost()) return
+        val me = personOf(self.id, self.name.ifBlank { context.getString(R.string.notif_self_name) }, self.avatarBytes)
+        val isGroupConversation = r.kind != ConversationKind.DM
+        val style = NotificationCompat.MessagingStyle(me).setGroupConversation(isGroupConversation)
+        // A 1:1 DM shows the peer's name as the title (from the message Person); a group/room/mention
+        // shows the resolved conversation title instead.
+        if (isGroupConversation) style.setConversationTitle(displayTitle(r.kind, r.title))
+        r.messages.forEach { m ->
+            style.addMessage(m.body, m.sentAt, personOf(m.senderId, m.senderName, m.avatarBytes))
+        }
+
+        // The conversation avatar (group photo / peer avatar, the Nearby room's Knit mark, else a generated
+        // letter avatar) shown as the notification's prominent icon. A plain setLargeIcon is ignored by
+        // MessagingStyle, so we publish a long-lived conversation shortcut carrying this icon and point the
+        // notification at it — that gives the Signal-style avatar in the collapsed, group-child, and heads-up
+        // views (Conversations section).
+        val title = displayTitle(r.kind, r.title)
+        val conversation = NotifConversation(r.conversationId, r.title, r.avatarBytes, r.kind, r.faces)
+        val avatar = shortcuts.avatarOf(conversation, title)
+        shortcuts.push(conversation, title, avatar)
+
+        val channelId = if (r.isMention) NotificationChannels.MENTIONS else NotificationChannels.channelFor(r.kind)
+        val builder =
+            NotificationCompat
+                .Builder(context, channelId)
+                .setSmallIcon(R.drawable.ic_stat_mesh)
+                .setStyle(style)
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setGroup(GROUP_KEY_MESSAGES)
+                .setShortcutId(r.conversationId)
+                .setLocusId(LocusIdCompat(r.conversationId))
+                .setLargeIcon(avatar)
+                .setContentIntent(openChatIntent(r.tag, r.conversationId))
+                .setDeleteIntent(dismissIntent(r.tag))
+                .apply {
+                    // No inline reply for the Meshtastic room: a post there needs the first-use disclosure
+                    // and the byte budget, both of which live in the composer. A reply typed from the shade
+                    // would be echoed as sent and go nowhere.
+                    if (r.kind != ConversationKind.MESHTASTIC) addAction(replyAction(r.tag, r.conversationId))
+                }.addAction(markReadAction(r.tag, r.conversationId))
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+
+        postNotification(r.tag, ID_MESSAGE, builder.build())
+    }
+
+    /**
+     * (Re)posts the group summary ("N messages in M chats") over the current per-conversation state, or
+     * cancels it only once **no** conversations remain. The summary must survive down to a single child:
+     * cancelling a group summary while a child still exists also cancels that child (Android groups them),
+     * so we always keep it posted for ≥1 conversation. Stock Android hides the summary for a single-child
+     * group and shows the child on its own — matching Signal, where the "N messages in M chats" line only
+     * appears once messages span multiple chats (so we set that text only for ≥2, using the lone line
+     * otherwise for the rare OEM that renders it).
+     */
+    private fun postSummary() {
+        if (!canPost()) return
+        val counts: List<Int>
+        val lines: List<CharSequence>
+        val channel: String
+        synchronized(states) {
+            if (states.isEmpty()) {
+                runCatching { manager.cancel(ID_SUMMARY) }
+                return
+            }
+            counts = states.values.map { it.count }
+            lines = states.values.map { lineFor(it) }
+            channel = summaryChannel(states.values)
+        }
+        val (total, chats) = summaryCounts(counts)
+        val summaryText =
+            if (chats >= 2) context.getString(R.string.notif_summary, total, chats) else lines.firstOrNull() ?: ""
+        val inbox =
+            NotificationCompat
+                .InboxStyle()
+                .setSummaryText(context.getString(R.string.app_name))
+        lines.forEach { inbox.addLine(it) }
+        val summary =
+            NotificationCompat
+                .Builder(context, channel)
+                .setSmallIcon(R.drawable.ic_stat_mesh)
+                .setStyle(inbox)
+                .setContentTitle(context.getString(R.string.app_name))
+                .setContentText(summaryText)
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setGroup(GROUP_KEY_MESSAGES)
+                .setGroupSummary(true)
+                // Children alert on their own channels; the summary must not double-buzz.
+                .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+                .setContentIntent(openAppIntent())
+                .setDeleteIntent(dismissIntent(DISMISS_ALL))
+                .setAutoCancel(true)
+                .build()
+        postNotification(null, ID_SUMMARY, summary)
+    }
+
+    /**
+     * Posts [notification] under [id] (with an optional [tag]). The POST_NOTIFICATIONS permission check is
+     * inlined here — right at the `manager.notify` call — because lint's flow analysis only recognizes the
+     * guard when it sits on the direct path to notify, not when extracted into a helper like [canPost].
+     */
+    private fun postNotification(
+        tag: String?,
+        id: Int,
+        notification: Notification,
+    ) {
+        if (!manager.areNotificationsEnabled()) return
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        runCatching { if (tag != null) manager.notify(tag, id, notification) else manager.notify(id, notification) }
+    }
+
+    /** One summary line: the bold conversation title followed by the latest message preview. */
+    private fun lineFor(state: ConvState): CharSequence {
+        val last = state.history.snapshot().lastOrNull()
+        val title = displayTitle(state.kind, state.title)
+        val preview =
+            when {
+                last == null -> ""
+                state.kind == ConversationKind.DM -> last.body
+                else -> "${last.senderName}: ${last.body}"
+            }
+        val text = if (preview.isBlank()) title else "$title  $preview"
+        return SpannableString(text).apply {
+            setSpan(StyleSpan(Typeface.BOLD), 0, title.length, Spanned.SPAN_INCLUSIVE_EXCLUSIVE)
+        }
+    }
+
+    /** Picks the summary's channel = the highest-importance kind currently present (so the group ranks right). */
+    private fun summaryChannel(present: Collection<ConvState>): String =
+        when {
+            present.any { it.isMention } -> NotificationChannels.MENTIONS
+            present.any { it.kind == ConversationKind.DM } -> NotificationChannels.DMS
+            present.any { it.kind == ConversationKind.GROUP } -> NotificationChannels.GROUPS
+            else -> NotificationChannels.NEARBY
+        }
+
+    private fun canPost(): Boolean {
+        if (!manager.areNotificationsEnabled()) return false
+        // Explicit POST_NOTIFICATIONS check (runtime permission on API 33+). areNotificationsEnabled()
+        // already implies it, but lint's flow analysis needs the explicit check on every path to notify().
+        return ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun personOf(
+        id: String,
+        name: String,
+        avatarBytes: ByteArray?,
+    ): Person {
+        val display = name.ifBlank { id }
+        return Person
+            .Builder()
+            .setKey(id)
+            .setName(display)
+            .setIcon(IconCompat.createWithAdaptiveBitmap(avatars.bitmapFor(avatarBytes) ?: avatars.letterAvatar(display, key = id)))
+            .build()
+    }
+
+    /** The real conversation title for all kinds (the shortcut's label, the avatar's initial, the summary line). */
+    private fun displayTitle(
+        kind: ConversationKind,
+        title: String?,
+    ): String = shortcuts.titleOf(kind, title)
+
+    /** Deep-link tap: opens (or brings forward) [MainActivity] straight to `chat/<conversationId>`. */
+    private fun openChatIntent(
+        tag: String,
+        conversationId: String,
+    ): PendingIntent {
+        val intent =
+            Intent(context, MainActivity::class.java)
+                .setAction(ACTION_OPEN_CHAT)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(MainActivity.EXTRA_ROUTE, "chat/$conversationId")
+        return PendingIntent.getActivity(context, requestCode(tag, CODE_OPEN), intent, immutable())
+    }
+
+    private fun openAppIntent(): PendingIntent {
+        val intent = Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        return PendingIntent.getActivity(context, CODE_SUMMARY_OPEN, intent, immutable())
+    }
+
+    /** Deep-link tap: opens (or brings forward) [MainActivity] straight to the Message Requests inbox. */
+    private fun openRequestsIntent(): PendingIntent {
+        val intent =
+            Intent(context, MainActivity::class.java)
+                .setAction(ACTION_OPEN_REQUESTS)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(MainActivity.EXTRA_ROUTE, ROUTE_REQUESTS)
+        return PendingIntent.getActivity(context, CODE_REQUESTS_OPEN, intent, immutable())
+    }
+
+    private fun replyAction(
+        tag: String,
+        conversationId: String,
+    ): NotificationCompat.Action {
+        val remoteInput =
+            RemoteInput
+                .Builder(KEY_TEXT_REPLY)
+                .setLabel(context.getString(R.string.notif_reply_hint))
+                .build()
+        val intent = actionIntent(ACTION_REPLY, tag).putExtra(EXTRA_CONV, conversationId)
+        // RemoteInput requires a MUTABLE PendingIntent so the system can fill in the typed reply. FLAG_MUTABLE
+        // is API 31; pre-S PendingIntents are mutable by default, so the reply still works there without it.
+        val flags =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+        val pending = PendingIntent.getBroadcast(context, requestCode(tag, CODE_REPLY), intent, flags)
+        return NotificationCompat.Action
+            .Builder(R.drawable.ic_stat_mesh, context.getString(R.string.notif_action_reply), pending)
+            .addRemoteInput(remoteInput)
+            .setAllowGeneratedReplies(true)
+            .setShowsUserInterface(false)
+            .build()
+    }
+
+    private fun markReadAction(
+        tag: String,
+        conversationId: String,
+    ): NotificationCompat.Action {
+        val intent = actionIntent(ACTION_MARK_READ, tag).putExtra(EXTRA_CONV, conversationId)
+        val pending = PendingIntent.getBroadcast(context, requestCode(tag, CODE_MARK_READ), intent, immutable())
+        return NotificationCompat.Action
+            .Builder(R.drawable.ic_stat_mesh, context.getString(R.string.notif_action_mark_read), pending)
+            .setShowsUserInterface(false)
+            .build()
+    }
+
+    private fun dismissIntent(tag: String): PendingIntent {
+        val intent = actionIntent(ACTION_DISMISS, tag)
+        return PendingIntent.getBroadcast(context, requestCode(tag, CODE_DISMISS), intent, immutable())
+    }
+
+    private fun actionIntent(
+        action: String,
+        tag: String,
+    ): Intent = Intent(context, NotificationActionReceiver::class.java).setAction(action).putExtra(EXTRA_TAG, tag)
+
+    private fun immutable() = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+
+    /** A per-(tag, action) request code so distinct notifications' PendingIntents never clobber each other. */
+    private fun requestCode(
+        tag: String,
+        action: Int,
+    ) = tag.hashCode() * CODE_SLOTS + action
+
+    private fun tagFor(
+        conversationId: String,
+        isMention: Boolean,
+    ): String = if (isMention) MENTION_PREFIX + conversationId else conversationId
+
+    /** Its own tag namespace, so an offer and the thread's messages never overwrite each other. */
+    private fun transferTagFor(conversationId: String): String = TRANSFER_PREFIX + conversationId
+
+    companion object {
+        const val EXTRA_TAG = "app.getknit.knit.NOTIF_TAG"
+        const val EXTRA_CONV = "app.getknit.knit.NOTIF_CONV"
+        const val KEY_TEXT_REPLY = "app.getknit.knit.KEY_TEXT_REPLY"
+
+        const val ACTION_OPEN_CHAT = "app.getknit.knit.NOTIF_OPEN_CHAT"
+        const val ACTION_OPEN_REQUESTS = "app.getknit.knit.NOTIF_OPEN_REQUESTS"
+        const val ACTION_REPLY = "app.getknit.knit.NOTIF_REPLY"
+        const val ACTION_MARK_READ = "app.getknit.knit.NOTIF_MARK_READ"
+        const val ACTION_DISMISS = "app.getknit.knit.NOTIF_DISMISS"
+
+        /** Sentinel tag on the summary's delete intent: swiping the summary clears every message notification. */
+        const val DISMISS_ALL = "app.getknit.knit.NOTIF_DISMISS_ALL"
+
+        private const val MENTION_PREFIX = "mention:"
+        private const val TRANSFER_PREFIX = "xfer:"
+
+        // Notification ids — id 1 is MeshService's foreground notification; 2-5 were the retired per-channel
+        // buckets. Per-conversation notifications now share one id disambiguated by tag; the summary gets its own.
+        private const val ID_MESSAGE = 6
+        private const val ID_SUMMARY = 7
+
+        // The single coalesced "N message requests" heads-up (standalone — not in the messages group/summary).
+        private const val ID_REQUESTS = 8
+
+        // The single "someone nearby is open to chat" cue (standalone; refreshed in place).
+        private const val ID_OPEN_TO_CHAT = 9
+
+        // A direct-transfer offer (standalone, one per peer by tag — it is answered, not read).
+        private const val ID_TRANSFER = 10
+
+        // 11 is StorageAlert's: the mesh could not open its storage because the Keystore refused (ADR 2026-10.47rw).
+
+        // Its PendingIntent tag: a request code of its own so its deep link never clobbers a chat's.
+        private const val TAG_OPEN_TO_CHAT = "open-to-chat"
+
+        /** Groups every message notification under one stack with the summary. */
+        private const val GROUP_KEY_MESSAGES = "app.getknit.knit.MESSAGES"
+
+        // Request-code action slots (per tag), so open/reply/mark-read/dismiss don't collide.
+        private const val CODE_OPEN = 0
+        private const val CODE_REPLY = 1
+        private const val CODE_MARK_READ = 2
+        private const val CODE_DISMISS = 3
+        private const val CODE_SLOTS = 4
+        private const val CODE_SUMMARY_OPEN = 1
+        private const val CODE_REQUESTS_OPEN = 2
+
+        // The NavHost route the requests deep-link navigates to; MUST equal KnitApp's Routes.MESSAGE_REQUESTS.
+        private const val ROUTE_REQUESTS = "requests"
+    }
+}

@@ -1,0 +1,640 @@
+package app.getknit.knit.mesh.lora
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class LoraPacePolicyTest {
+    private fun frame(
+        label: String,
+        klass: FrameClass = FrameClass.ROOM,
+        supersedes: String? = null,
+    ) = OutboundFrame(messages = listOf(byteArrayOf(1)), label = label, klass = klass, supersedes = supersedes)
+
+    /**
+     * The queue has six writers on five coroutines and [java.util.ArrayDeque] is not thread-safe: a
+     * structural change under `admitBest`'s index walk nulls the slot it is about to read. Field-observed on
+     * the lab P7 (2026-09-10) as `NullPointerException: … OutboundFrame.getBucket()`, which kills the pacer
+     * loop and silences the plane until the app restarts.
+     *
+     * A race is not deterministic, so this leans on volume rather than on ordering: without the monitors it
+     * fails within a run or two, and it costs a few hundred milliseconds when they are there.
+     */
+    @Test
+    fun aQueueDrainedWhileOtherThreadsEnqueueDoesNotTearItself() {
+        val pace = LoraPacePolicy(minGapMs = 0, queueCap = 64)
+        pace.onQueueStatus(free = 16)
+        val failures = java.util.concurrent.CopyOnWriteArrayList<Throwable>()
+        val start = java.util.concurrent.CountDownLatch(1)
+        val writers =
+            (1..4).map { w ->
+                Thread {
+                    start.await()
+                    runCatching { repeat(2_000) { pace.enqueue(frame("w$w-$it", FrameClass.entries[it % FrameClass.entries.size])) } }
+                        .onFailure { failures += it }
+                }
+            }
+        val drainer =
+            Thread {
+                start.await()
+                runCatching { repeat(8_000) { pace.take(it.toLong()) } }.onFailure { failures += it }
+            }
+        (writers + drainer).forEach { it.start() }
+        start.countDown()
+        (writers + drainer).forEach { it.join(30_000) }
+
+        assertTrue("the queue tore under concurrent access: ${failures.firstOrNull()}", failures.isEmpty())
+    }
+
+    @Test
+    fun holdsTheMinimumGapBetweenSends() {
+        val pace = LoraPacePolicy(minGapMs = 3_000)
+        pace.enqueue(frame("a"))
+        pace.enqueue(frame("b"))
+        assertEquals("a", pace.take(0)!!.label)
+        assertNull("second send blocked until the gap elapses", pace.take(2_999))
+        assertEquals("b", pace.take(3_000)!!.label)
+    }
+
+    @Test
+    fun theQueueDropsTheOldestWholeFrameWhenFull() {
+        val pace = LoraPacePolicy(queueCap = 2)
+        assertEquals(LoraPacePolicy.Admission.ACCEPTED, pace.enqueue(frame("a")))
+        assertEquals(LoraPacePolicy.Admission.ACCEPTED, pace.enqueue(frame("b")))
+        assertEquals(LoraPacePolicy.Admission.DROPPED_OLDEST, pace.enqueue(frame("c")))
+        assertEquals(2, pace.pending)
+        assertEquals("oldest evicted, b is next", "b", pace.take(10_000)!!.label)
+        assertEquals("c", pace.take(20_000)!!.label)
+    }
+
+    @Test
+    fun aFullQueueShedsTheRoomBeforeADmAndNeverTheProfile() {
+        val pace = LoraPacePolicy(queueCap = 3)
+        pace.enqueue(frame("profile", FrameClass.BOOTSTRAP))
+        pace.enqueue(frame("room-1"))
+        pace.enqueue(frame("dm-1", FrameClass.DM))
+        // A second DM evicts the room post (the lowest class present), not the older profile or DM.
+        assertEquals(LoraPacePolicy.Admission.DROPPED_OLDEST, pace.enqueue(frame("dm-2", FrameClass.DM)))
+        assertEquals(listOf("profile", "dm-1", "dm-2"), drain(pace))
+    }
+
+    @Test
+    fun aNewcomerAloneAtTheBottomYieldsInsteadOfEvicting() {
+        val pace = LoraPacePolicy(queueCap = 2)
+        pace.enqueue(frame("profile", FrameClass.BOOTSTRAP))
+        pace.enqueue(frame("dm", FrameClass.DM))
+        assertEquals("a room post cannot displace a DM or the bootstrap", LoraPacePolicy.Admission.REFUSED, pace.enqueue(frame("room")))
+        assertEquals(2, pace.pending)
+        // Within one class the oldest still goes and the newcomer stays (recency wins, as before).
+        assertEquals(LoraPacePolicy.Admission.DROPPED_OLDEST, pace.enqueue(frame("dm-2", FrameClass.DM)))
+        assertEquals(listOf("profile", "dm-2"), drain(pace))
+    }
+
+    @Test
+    fun dequeueGoesByClassThenFifoWithinIt() {
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.enqueue(frame("tick", FrameClass.TICK))
+        pace.enqueue(frame("room"))
+        pace.enqueue(frame("dm", FrameClass.DM))
+        pace.enqueue(frame("profile", FrameClass.BOOTSTRAP))
+        // ADR 044 changed this from plain FIFO: the bridge enqueues gossip and backfill in bursts nobody is
+        // waiting for, and at a 3-second gap those would put a live message seconds behind for no reason.
+        assertEquals("class governs send order too", listOf("profile", "dm", "room", "tick"), drain(pace))
+    }
+
+    /** ADR 054: our own ✓✓ is the first thing a full queue gives up, whichever side of the cap it arrives on. */
+    @Test
+    fun aFullQueueShedsATickBeforeTheRoomAndATickAloneAtTheBottomYields() {
+        val pace = LoraPacePolicy(queueCap = 2)
+        pace.enqueue(frame("tick", FrameClass.TICK))
+        pace.enqueue(frame("room"))
+        assertEquals(LoraPacePolicy.Admission.DROPPED_OLDEST, pace.enqueue(frame("dm", FrameClass.DM)))
+        assertEquals(listOf("dm", "room"), drain(pace))
+
+        val again = LoraPacePolicy(queueCap = 2)
+        again.enqueue(frame("room"))
+        again.enqueue(frame("dm", FrameClass.DM))
+        assertEquals("a tick cannot displace content", LoraPacePolicy.Admission.REFUSED, again.enqueue(frame("tick", FrameClass.TICK)))
+        assertEquals(listOf("dm", "room"), drain(again))
+    }
+
+    @Test
+    fun withinOneClassTheOldestStillGoesFirst() {
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.enqueue(frame("room-1"))
+        pace.enqueue(frame("room-2"))
+        pace.enqueue(frame("dm", FrameClass.DM))
+        pace.enqueue(frame("room-3"))
+        assertEquals(listOf("dm", "room-1", "room-2", "room-3"), drain(pace))
+    }
+
+    @Test
+    fun aFrameOverItsAirtimeBudgetIsSkippedRatherThanBlockingTheQueue() {
+        // A bridge frame with the bridge share spent must not hold up the live frame behind it.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        var now = 0L
+        while (air.admits(AirBucket.BRIDGE, FrameClass.ROOM, listOf(MeshtasticProto.MAX_PAYLOAD), now)) {
+            air.record(AirBucket.BRIDGE, MeshtasticProto.MAX_PAYLOAD, now)
+            now += 3_000
+        }
+        val big = ByteArray(MeshtasticProto.MAX_PAYLOAD)
+        pace.enqueue(OutboundFrame(listOf(big), "backfill", FrameClass.ROOM, AirBucket.BRIDGE))
+        pace.enqueue(OutboundFrame(listOf(big), "live", FrameClass.ROOM, AirBucket.LIVE))
+        assertEquals("live", pace.take(now)!!.label)
+        assertEquals("the refused backfill is still queued, not dropped", 1, pace.pending)
+        assertEquals(1, pace.lastAirtimeRefusals)
+    }
+
+    /**
+     * Spends the window's total down to one packet's worth: everything booked live until a single full packet no
+     * longer fits, then the window rolls far enough to hand the oldest booking back. A one-packet frame now fits
+     * and a two-packet one does not, the state the 2026-10-04 walk sat in for eleven minutes. Returns the time.
+     */
+    private fun oneSlotLeft(air: LoraAirtime): Long {
+        var now = 0L
+        while (air.admits(AirBucket.LIVE, FrameClass.ROOM, listOf(MeshtasticProto.MAX_PAYLOAD), now)) {
+            air.record(AirBucket.LIVE, MeshtasticProto.MAX_PAYLOAD, now)
+            now += 3_000
+        }
+        now = air.nextReleaseAt(now)!!
+        assertTrue(air.admits(AirBucket.LIVE, FrameClass.ROOM, listOf(MeshtasticProto.MAX_PAYLOAD), now))
+        assertFalse(air.admits(AirBucket.LIVE, FrameClass.DM, List(2) { MeshtasticProto.MAX_PAYLOAD }, now))
+        return now
+    }
+
+    private fun live(
+        label: String,
+        klass: FrameClass,
+        parts: Int,
+        bucket: AirBucket = AirBucket.LIVE,
+    ) = OutboundFrame(List(parts) { ByteArray(MeshtasticProto.MAX_PAYLOAD) }, label, klass, bucket)
+
+    @Test
+    fun aDmTheTotalRefusesHoldsTheRoomPostsThatWouldTakeItsAir() {
+        // The 2026-10-04 walk: a two-packet DM waited from 16:28 to 16:39 while one-packet room posts took each
+        // packet's worth of air the rolling window handed back.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        var now = oneSlotLeft(air)
+        pace.enqueue(live("dm", FrameClass.DM, parts = 2))
+        pace.enqueue(live("room", FrameClass.ROOM, parts = 1))
+        assertNull("the room post fits, but it would spend the air the DM is waiting for", pace.take(now))
+        assertEquals("both still queued", 2, pace.pending)
+        assertEquals(2, pace.lastAirtimeRefusals)
+        now = air.nextReleaseAt(now)!!
+        assertEquals("a second packet's worth back, and the DM goes first", "dm", pace.take(now)!!.label)
+    }
+
+    @Test
+    fun aBackfilledDmNeverHoldsLiveChat() {
+        // A backfilled DM keeps DM class but spends the bridge's share (ADR 044): it waits for air like any frame,
+        // but holding live traffic behind it would let backfill crowd live chat, which the share exists to prevent.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        val now = oneSlotLeft(air)
+        pace.enqueue(live("backfill", FrameClass.DM, parts = 2, bucket = AirBucket.BRIDGE))
+        pace.enqueue(live("room", FrameClass.ROOM, parts = 1))
+        assertEquals("room", pace.take(now)!!.label)
+    }
+
+    @Test
+    fun theClassesAboveAHeldDmStillGo() {
+        // The hold is on what ranks behind the DM. The profile is judged on its own share, and the offer outranks
+        // the DM as it always has.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        val now = oneSlotLeft(air)
+        pace.enqueue(live("dm", FrameClass.DM, parts = 2))
+        pace.enqueue(live("offer", FrameClass.GOSSIP, parts = 1, bucket = AirBucket.GOSSIP))
+        pace.enqueue(live("profile", FrameClass.BOOTSTRAP, parts = 1, bucket = AirBucket.BOOTSTRAP))
+        assertEquals("profile", pace.take(now)!!.label)
+        assertEquals("offer", pace.take(now)!!.label)
+    }
+
+    @Test
+    fun aDmQueuedAheadOfTheHeldOneStillGoesAndOneBehindItWaits() {
+        // FIFO within the class: the hold is on what dequeues after the held frame, not on the whole class.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        val now = oneSlotLeft(air)
+        pace.enqueue(live("dm:short", FrameClass.DM, parts = 1))
+        pace.enqueue(live("dm:long", FrameClass.DM, parts = 2))
+        pace.enqueue(live("dm:later", FrameClass.DM, parts = 1))
+        assertEquals("dm:short", pace.take(now)!!.label)
+        val after = LoraPacePolicy(minGapMs = 0, airtime = LoraAirtime())
+        val then = oneSlotLeft(after.airtime)
+        after.enqueue(live("dm:long", FrameClass.DM, parts = 2))
+        after.enqueue(live("dm:later", FrameClass.DM, parts = 1))
+        assertNull("the later DM would take the long one's air", after.take(then))
+    }
+
+    @Test
+    fun nothingWaitsOnAFrameNoWindowWouldAdmit() {
+        // Bigger than the whole allowance: holding the queue behind it would hold it forever.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        val now = oneSlotLeft(air)
+        val parts = (air.budgetMs(AirBucket.LIVE) / air.timeOnAirMs(MeshtasticProto.MAX_PAYLOAD) + 1).toInt()
+        pace.enqueue(live("huge", FrameClass.DM, parts = parts))
+        pace.enqueue(live("room", FrameClass.ROOM, parts = 1))
+        assertEquals("room", pace.take(now)!!.label)
+    }
+
+    @Test
+    fun aFrameHeldBehindAHeldDmIsReportedOnce() {
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        val now = oneSlotLeft(air)
+        pace.enqueue(live("dm", FrameClass.DM, parts = 2))
+        pace.enqueue(live("room", FrameClass.ROOM, parts = 1))
+        assertNull(pace.take(now))
+        assertEquals(listOf(AirBucket.LIVE, AirBucket.LIVE), pace.lastAirtimeHolds)
+        assertNull(pace.take(now + 1))
+        assertEquals("still waiting, no longer news", emptyList<AirBucket>(), pace.lastAirtimeHolds)
+    }
+
+    @Test
+    fun aSupersededOfferLeavesTheQueue() {
+        // An OFFER is a snapshot of what we hold. One still queued from a previous interval names a set we
+        // have since changed, so a far gateway would compute its backfill against a lie — and one queued at
+        // a time is what keeps the Trickle timer, not the queue, the rate bound on this class.
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.enqueue(frame("offer:old", FrameClass.GOSSIP, supersedes = "offer"))
+        pace.enqueue(frame("room"))
+        pace.enqueue(frame("offer:new", FrameClass.GOSSIP, supersedes = "offer"))
+        assertEquals("the older snapshot went, not the room post", 2, pace.pending)
+        assertEquals(1, pace.lastSuperseded)
+        assertEquals("offer:new", pace.take(0)!!.label)
+        assertEquals("nothing else went with it", "room", pace.take(0)!!.label)
+    }
+
+    @Test
+    fun aProfileSupersedesOnlyItsOwnAuthorsOlderCopy() {
+        // Two peers' profiles are different state and neither replaces the other. Getting this wrong in the
+        // other direction — one key for the whole class — would drop a peer's only profile whenever anybody
+        // else republished, which is the bootstrap the far side cannot decrypt anything without.
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.enqueue(frame("alice:v1", FrameClass.BOOTSTRAP, supersedes = "profile:alice"))
+        pace.enqueue(frame("bob:v1", FrameClass.BOOTSTRAP, supersedes = "profile:bob"))
+        pace.enqueue(frame("alice:v2", FrameClass.BOOTSTRAP, supersedes = "profile:alice"))
+
+        assertEquals(2, pace.pending)
+        assertEquals(1, pace.lastSuperseded)
+        assertEquals("bob:v1", pace.take(0)!!.label)
+        assertEquals("only the newest copy of alice survives", "alice:v2", pace.take(0)!!.label)
+    }
+
+    @Test
+    fun aSnapshotBacklogCannotStarveTheOfferForever() {
+        // The lab failure this exists for. Profiles outrank the OFFER in the dequeue (BOOTSTRAP < GOSSIP),
+        // so before supersession a growing backlog of them took every window's freed air and the offer was
+        // never *chosen* — `loraOfferSent` stuck at 0 and the gateway election could never settle. Bounded
+        // per author, the backlog drains and the offer gets its turn.
+        val pace = LoraPacePolicy(minGapMs = 0)
+        repeat(30) { i -> pace.enqueue(frame("alice:v$i", FrameClass.BOOTSTRAP, supersedes = "profile:alice")) }
+        pace.enqueue(frame("offer", FrameClass.GOSSIP, supersedes = "offer"))
+
+        assertEquals("one profile, not thirty", 2, pace.pending)
+        assertEquals("alice:v29", pace.take(0)!!.label)
+        assertEquals("and the offer is right behind it", "offer", pace.take(0)!!.label)
+    }
+
+    @Test
+    fun aSupersessionIsNeverCountedAsADrop() {
+        // `loraDroppedQueue` says the plane shed something it wanted. Nothing is lost here that the newer
+        // frame does not already carry, so the newcomer must still report ACCEPTED.
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.enqueue(frame("offer:old", FrameClass.GOSSIP, supersedes = "offer"))
+        assertEquals(
+            LoraPacePolicy.Admission.ACCEPTED,
+            pace.enqueue(frame("offer:new", FrameClass.GOSSIP, supersedes = "offer")),
+        )
+    }
+
+    @Test
+    fun aFullQueueMakesRoomBySupersedingBeforeItSheds() {
+        // Supersession runs first, so a snapshot replacing its own older copy never costs an unrelated frame
+        // its slot — the queue was never really full for this newcomer.
+        val pace = LoraPacePolicy(minGapMs = 0, queueCap = 2)
+        pace.enqueue(frame("alice:v1", FrameClass.BOOTSTRAP, supersedes = "profile:alice"))
+        pace.enqueue(frame("room"))
+        assertEquals(
+            LoraPacePolicy.Admission.ACCEPTED,
+            pace.enqueue(frame("alice:v2", FrameClass.BOOTSTRAP, supersedes = "profile:alice")),
+        )
+        assertEquals(2, pace.pending)
+        assertEquals("alice:v2", pace.take(0)!!.label)
+        assertEquals("the unrelated frame kept its place", "room", pace.take(0)!!.label)
+    }
+
+    @Test
+    fun aHeldFrameIsReportedOnceAndNotOnEveryTake() {
+        // The pacer re-asks the budget every few seconds; a counter built on that would report the clock.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        var now = 0L
+        while (air.admits(AirBucket.BRIDGE, FrameClass.ROOM, listOf(MeshtasticProto.MAX_PAYLOAD), now)) {
+            air.record(AirBucket.BRIDGE, MeshtasticProto.MAX_PAYLOAD, now)
+            now += 3_000
+        }
+        val big = ByteArray(MeshtasticProto.MAX_PAYLOAD)
+        pace.enqueue(OutboundFrame(listOf(big), "backfill", FrameClass.ROOM, AirBucket.BRIDGE))
+        assertNull(pace.take(now))
+        assertEquals(listOf(AirBucket.BRIDGE), pace.lastAirtimeHolds)
+        assertNull(pace.take(now + 3_000))
+        assertEquals("still stuck, but no longer news", emptyList<AirBucket>(), pace.lastAirtimeHolds)
+        assertEquals("and still queued, never dropped", 1, pace.pending)
+    }
+
+    @Test
+    fun theOfferGoesWhileTheBackfillBesideItWaitsForTheWindow() {
+        // The whole failure, at the layer that decides it: the bridge bucket is spent, and only the packet
+        // that unlocks the far pocket's reply may still leave. Since ADR 2026-09.7c8n the offer books its
+        // own bucket, so it is not part of what spent this one either.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        var now = 0L
+        while (air.admits(AirBucket.BRIDGE, FrameClass.ROOM, listOf(MeshtasticProto.MAX_PAYLOAD), now)) {
+            air.record(AirBucket.BRIDGE, MeshtasticProto.MAX_PAYLOAD, now)
+            now += 3_000
+        }
+        val big = ByteArray(MeshtasticProto.MAX_PAYLOAD)
+        pace.enqueue(OutboundFrame(listOf(big), "backfill", FrameClass.ROOM, AirBucket.BRIDGE))
+        pace.enqueue(OutboundFrame(listOf(big), "offer", FrameClass.GOSSIP, AirBucket.GOSSIP))
+        assertEquals("offer", pace.take(now)!!.label)
+        assertEquals("the backfill it would have crowded out is still queued", 1, pace.pending)
+    }
+
+    @Test
+    fun theBootstrapRidesEvenWithTheBudgetSpent() {
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        var now = 0L
+        while (air.admits(AirBucket.LIVE, FrameClass.ROOM, listOf(MeshtasticProto.MAX_PAYLOAD), now)) {
+            air.record(AirBucket.LIVE, MeshtasticProto.MAX_PAYLOAD, now)
+            now += 3_000
+        }
+        val big = ByteArray(MeshtasticProto.MAX_PAYLOAD)
+        pace.enqueue(OutboundFrame(listOf(big), "room", FrameClass.ROOM, AirBucket.LIVE))
+        pace.enqueue(OutboundFrame(listOf(big), "profile", FrameClass.BOOTSTRAP))
+        assertEquals("profile", pace.take(now)!!.label)
+        assertNull("everything else waits for the window to roll", pace.take(now + 10_000))
+    }
+
+    @Test
+    fun aBootstrapFrameOverItsOwnShareWaitsInTheQueueRatherThanBeingLost() {
+        // ADR 056: the bootstrap is bounded now, so it can be refused — and a refused profile must be
+        // deferred like any other frame, since dropping the key bootstrap is what the exemption existed
+        // to prevent in the first place.
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        val big = ByteArray(MeshtasticProto.MAX_PAYLOAD)
+        var now = 0L
+        while (air.admits(AirBucket.BOOTSTRAP, FrameClass.BOOTSTRAP, listOf(MeshtasticProto.MAX_PAYLOAD), now)) {
+            air.record(AirBucket.BOOTSTRAP, MeshtasticProto.MAX_PAYLOAD, now)
+            now += 3_000
+        }
+        pace.enqueue(OutboundFrame(listOf(big), "profile", FrameClass.BOOTSTRAP))
+        pace.enqueue(OutboundFrame(listOf(big), "dm", FrameClass.DM, AirBucket.LIVE))
+        assertEquals("the DM goes while the profile's share is spent", "dm", pace.take(now)!!.label)
+        assertEquals("the profile is still queued, not dropped", 1, pace.pending)
+        assertEquals(1, pace.lastAirtimeRefusals)
+        // A whole window later its share is back and it rides.
+        val later = now + LoraAirtime.WINDOW_MS
+        assertEquals("profile", pace.take(later)!!.label)
+    }
+
+    @Test
+    fun aBootstrapFrameTakesTheBootstrapBucketWithoutBeingTold() {
+        // The class implies the bucket (AirBucket.defaultFor), so no call site can accidentally book a
+        // profile against LIVE and get the old unmetered behaviour back.
+        assertEquals(AirBucket.BOOTSTRAP, OutboundFrame(listOf(ByteArray(1)), "profile", FrameClass.BOOTSTRAP).bucket)
+        assertEquals(AirBucket.LIVE, OutboundFrame(listOf(ByteArray(1)), "dm", FrameClass.DM).bucket)
+        assertEquals(
+            "an explicit bucket still wins — a backfilled profile is bridge traffic",
+            AirBucket.BRIDGE,
+            OutboundFrame(listOf(ByteArray(1)), "backfill", FrameClass.BOOTSTRAP, AirBucket.BRIDGE).bucket,
+        )
+    }
+
+    /** Takes everything queued, advancing the clock past the min gap between takes. */
+    private fun drain(pace: LoraPacePolicy): List<String> {
+        var now = 1_000_000L
+        return generateSequence { pace.take(now).also { now += 10_000 } }.map { it.label }.toList()
+    }
+
+    @Test
+    fun aFullBoardQueueHoldsAllSends() {
+        val pace = LoraPacePolicy()
+        pace.enqueue(frame("a"))
+        pace.onQueueStatus(free = 0)
+        assertNull("board has no headroom", pace.take(10_000))
+        pace.onQueueStatus(free = 3)
+        assertNotNull(pace.take(10_000))
+    }
+
+    @Test
+    fun aRateLimitNakWidensTheGap() {
+        val pace = LoraPacePolicy(minGapMs = 3_000, nakBackoffMs = 60_000)
+        pace.enqueue(frame("a"))
+        assertNotNull(pace.take(0))
+        pace.enqueue(frame("b"))
+        pace.onNak(RoutingError.RATE_LIMIT_EXCEEDED, now = 1_000)
+        assertNull("cool-down blocks the next send past the normal gap", pace.take(3_000))
+        assertNotNull("sends resume after the cool-down", pace.take(61_000))
+    }
+
+    @Test
+    fun anUnrelatedNakDoesNotPace() {
+        val pace = LoraPacePolicy(minGapMs = 3_000)
+        pace.enqueue(frame("a"))
+        assertNotNull(pace.take(0))
+        pace.enqueue(frame("b"))
+        pace.onNak(RoutingError.NO_CHANNEL, now = 1_000)
+        assertNotNull("a NO_CHANNEL nak is not a rate limit", pace.take(3_000))
+    }
+
+    /**
+     * The regression behind the pacer spin: a queue nothing may leave must report a due time in the *future*.
+     * Before this, `nextDueAt()` still read "3 s after the last send" — already past — so the transport's
+     * drain loop computed a zero wait, never suspended, and spun a core until the window pruned.
+     */
+    @Test
+    fun aSaturatedBudgetDefersTheNextSendToWhenTheWindowFreesAir() {
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 3_000, airtime = air)
+        var at = 0L
+        var spent = 0L
+        while (spent < air.allowanceMs()) {
+            air.record(AirBucket.LIVE, 200, at)
+            spent += air.timeOnAirMs(200)
+            at += 3_000
+        }
+        val big = OutboundFrame(messages = listOf(ByteArray(200)), label = "room", klass = FrameClass.ROOM)
+        pace.enqueue(big)
+
+        val now = at + 3_000
+        assertNull("the budget is spent, so nothing goes out", pace.take(now))
+        assertEquals(1, pace.lastAirtimeRefusals)
+        assertTrue(
+            "the next send is deferred to when the window returns air, not left in the past (${pace.nextDueAt()} <= $now)",
+            pace.nextDueAt() > now,
+        )
+        assertEquals("and that is the oldest sample's expiry", air.nextReleaseAt(now), pace.nextDueAt())
+    }
+
+    @Test
+    fun aNewFrameLiftsTheAirtimeDeferralSoTheBootstrapIsNotHeldBehindIt() {
+        val air = LoraAirtime()
+        val pace = LoraPacePolicy(minGapMs = 0, airtime = air)
+        var at = 0L
+        var spent = 0L
+        while (spent < air.allowanceMs()) {
+            air.record(AirBucket.LIVE, 200, at)
+            spent += air.timeOnAirMs(200)
+            at += 3_000
+        }
+        pace.enqueue(OutboundFrame(messages = listOf(ByteArray(200)), label = "room"))
+        assertNull(pace.take(at))
+        assertTrue("deferred", pace.nextDueAt() > at)
+
+        // A profile is always admitted, so the deferral the room post earned must not strand it.
+        pace.enqueue(OutboundFrame(messages = listOf(ByteArray(200)), label = "profile", klass = FrameClass.BOOTSTRAP))
+        assertEquals("profile", pace.take(at)?.label)
+    }
+
+    @Test
+    fun takeIsNullWhenEmpty() {
+        assertNull(LoraPacePolicy().take(10_000))
+    }
+
+    @Test
+    fun evictOversizeShedsOnlyFramesWithAPartPastTheCap() {
+        val pace = LoraPacePolicy()
+        pace.enqueue(OutboundFrame(listOf(ByteArray(233), ByteArray(40)), "chunked-at-the-old-max", FrameClass.DM))
+        pace.enqueue(OutboundFrame(listOf(ByteArray(120)), "fits", FrameClass.ROOM))
+        pace.enqueue(OutboundFrame(listOf(ByteArray(100), ByteArray(229)), "tail-too-big", FrameClass.ROOM))
+        assertEquals(2, pace.evictOversize(228))
+        assertEquals(1, pace.pending)
+        assertEquals("fits", pace.take(now = 0L)?.label)
+        assertEquals(0, pace.evictOversize(1))
+    }
+
+    /** ADR 2026-10.a4pm: the re-offer lifts the bridge's queued copy of a frame onto LIVE, in place. */
+    @Test
+    fun anUnstartedCopyOnAnotherBucketIsUpgradedInPlace() {
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.onQueueStatus(free = 16)
+        pace.enqueue(frame("room"))
+        pace.enqueue(OutboundFrame(listOf(byteArrayOf(1)), "bridge:x", FrameClass.DM, AirBucket.BRIDGE, supersedes = "frame:x"))
+        pace.enqueue(frame("room 2"))
+        val lifted = OutboundFrame(listOf(byteArrayOf(1)), "reoffer:x", FrameClass.DM, AirBucket.LIVE, supersedes = "frame:x")
+        assertTrue(pace.upgradeQueued(lifted))
+        assertEquals(3, pace.pending)
+        assertFalse("already on LIVE", pace.upgradeQueued(lifted))
+        assertFalse(
+            "never a downgrade",
+            pace.upgradeQueued(OutboundFrame(listOf(byteArrayOf(1)), "relayed", FrameClass.DM, AirBucket.BRIDGE, supersedes = "frame:x")),
+        )
+        assertFalse("nothing queued under that key", pace.upgradeQueued(OutboundFrame(listOf(byteArrayOf(1)), "y", supersedes = "frame:y")))
+        assertEquals("DM class drains first, as the copy it replaced would have", listOf("reoffer:x", "room", "room 2"), drain(pace))
+    }
+
+    /** feb2d5a4: a frame the board has taken part of finishes as it is — neither upgraded nor superseded. */
+    @Test
+    fun aPartSentCopyIsNeitherUpgradedNorSuperseded() {
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.onQueueStatus(free = 16)
+        val started =
+            OutboundFrame(listOf(byteArrayOf(1), byteArrayOf(2)), "bridge:x", FrameClass.DM, AirBucket.BRIDGE, supersedes = "frame:x")
+        started.onPartSent()
+        pace.enqueue(started)
+        assertFalse(
+            pace.upgradeQueued(OutboundFrame(listOf(byteArrayOf(1)), "reoffer:x", FrameClass.DM, AirBucket.LIVE, supersedes = "frame:x")),
+        )
+        pace.enqueue(OutboundFrame(listOf(byteArrayOf(1)), "newer:x", FrameClass.DM, supersedes = "frame:x"))
+        assertEquals("the part-sent copy stayed", 0, pace.lastSuperseded)
+        assertEquals(2, pace.pending)
+    }
+
+    /** xdm2: a frame put back after a busy board is the one that was here, not a newer snapshot — it supersedes nothing. */
+    @Test
+    fun aRequeuedFrameSupersedesNothing() {
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.onQueueStatus(free = 16)
+        pace.enqueue(frame("alice:v1", FrameClass.BOOTSTRAP, supersedes = "profile:alice"))
+        val taken = checkNotNull(pace.take(1_000_000L))
+        pace.enqueue(frame("alice:v2", FrameClass.BOOTSTRAP, supersedes = "profile:alice"))
+        assertEquals(LoraPacePolicy.Admission.ACCEPTED, pace.requeue(taken))
+        assertEquals("the newer profile survived the older one coming back", 0, pace.lastSuperseded)
+        assertEquals(setOf("alice:v1", "alice:v2"), drain(pace).toSet())
+    }
+
+    @Test
+    fun hasQueuedSeesAWaitingCopyByKey() {
+        val pace = LoraPacePolicy(minGapMs = 0)
+        assertFalse(pace.hasQueued("frame:x"))
+        pace.enqueue(frame("probe", FrameClass.DM, supersedes = "frame:x"))
+        assertTrue(pace.hasQueued("frame:x"))
+        assertFalse(pace.hasQueued("frame:y"))
+    }
+
+    /** A frame being written is off the queue but not gone: it still counts as queued until the pacer hears its end. */
+    @Test
+    fun anInFlightFrameStillCountsAsQueued() {
+        val pace = LoraPacePolicy(minGapMs = 0)
+        pace.onQueueStatus(free = 16)
+        pace.enqueue(OutboundFrame(listOf(byteArrayOf(1)), "probe", FrameClass.DM, supersedes = "frame:x"))
+        val taken = checkNotNull(pace.take(1_000_000L))
+        assertTrue("in flight", pace.hasQueued("frame:x"))
+        assertFalse(
+            "and not upgraded under the writer",
+            pace.upgradeQueued(OutboundFrame(listOf(byteArrayOf(1)), "r", FrameClass.DM, AirBucket.BRIDGE, supersedes = "frame:x")),
+        )
+        pace.requeue(taken) // the board was busy: back in the queue, still one copy
+        assertTrue(pace.hasQueued("frame:x"))
+        val again = checkNotNull(pace.take(2_000_000L))
+        pace.done(again)
+        assertFalse("sent: gone", pace.hasQueued("frame:x"))
+    }
+
+    @Test
+    fun aShedFrameIsHandedBackForTheCallerToAbandon() {
+        val pace = LoraPacePolicy(minGapMs = 0, queueCap = 1)
+        val room = frame("room")
+        pace.enqueue(room)
+        pace.enqueue(frame("dm", FrameClass.DM))
+        assertEquals(listOf(room), pace.drainShed())
+        assertTrue(pace.drainShed().isEmpty())
+    }
+
+    /** A queued copy that holds a probe window is never swapped out: the replacement would not carry the claim. */
+    @Test
+    fun aQueuedProbeIsNeverSwappedOut() {
+        val pace = LoraPacePolicy(minGapMs = 0)
+        val claim = checkNotNull(LoraDmProbe().claim("bob", now = 0))
+        pace.enqueue(
+            OutboundFrame(listOf(byteArrayOf(1)), "probe", FrameClass.DM, AirBucket.BRIDGE, supersedes = "frame:x", probe = claim),
+        )
+        assertFalse(
+            pace.upgradeQueued(OutboundFrame(listOf(byteArrayOf(1)), "reoffer:x", FrameClass.DM, AirBucket.LIVE, supersedes = "frame:x")),
+        )
+    }
+
+    /** A refused newcomer — enqueued or requeued — is handed back like a shed frame, so its caller can abandon it. */
+    @Test
+    fun aRefusedFrameIsHandedBackToo() {
+        val pace = LoraPacePolicy(minGapMs = 0, queueCap = 1)
+        pace.enqueue(frame("dm", FrameClass.DM))
+        val tick = frame("tick", FrameClass.TICK)
+        assertEquals(LoraPacePolicy.Admission.REFUSED, pace.enqueue(tick))
+        assertEquals(listOf(tick), pace.drainShed())
+        val requeued = frame("tick 2", FrameClass.TICK)
+        assertEquals(LoraPacePolicy.Admission.REFUSED, pace.requeue(requeued))
+        assertEquals(listOf(requeued), pace.drainShed())
+    }
+}

@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Mesh transport plane 1: Wi-Fi Aware (NAN). On API 33+ discovery is location-free via
+         NEARBY_WIFI_DEVICES (neverForLocation); on API 29-32 there is no such permission, so Wi-Fi Aware
+         discovery needs ACCESS_FINE_LOCATION (declared below, shared with the BLE scan and with location sharing). -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+
+    <!-- Two users, one declaration. Discovery on API 29-32: Wi-Fi Aware (no NEARBY_WIFI_DEVICES before 33)
+         and the BLE scan (no neverForLocation before 31) both require fine location, asked at onboarding on
+         those versions only (ui/Permissions.kt keeps the 33+ tier location-free). And "Send location" on every
+         version: the composer's pin reads the device's position once, between the tap and the send, through
+         location/AndroidLocationSource — asked the first time the pin is used, never at onboarding, never in the
+         background. Android 12 requires COARSE to be declared and requested alongside FINE (the
+         precise/approximate toggle).
+         The grant is "While using the app": the location app-op is foreground-only, and on 29-32 the Aware
+         service checks that app-op on every publish/subscribe, so a plain foreground service loses discovery
+         the moment Knit leaves the screen. The `location` foreground-service type on .mesh.MeshService below
+         is what lets the *service* keep discovering off screen; no code path reads a position there. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Data path (NDP): request the Aware network and open a TCP socket over its link-local IPv6. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Link previews (sender-side, off by default): ask the platform whether the *default* network is a
+         validated route to the Internet before a card is fetched, and bind that fetch to that network so it can
+         never ride the Wi-Fi Aware link. A normal permission with no prompt; read only by net/AndroidInternetGate,
+         never by the mesh, and never used to bind the process. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Wi-Fi Aware is a hardware feature; required=false so the app still installs on devices without
+         it (they surface an "unsupported" state at runtime rather than being filtered off the store). -->
+    <uses-feature android:name="android.hardware.wifi.aware" android:required="false" />
+
+    <!-- Mesh transport plane 2: Bluetooth LE (advertise/scan for discovery + presence/RSSI, L2CAP CoC for
+         the data socket). On API 31+ the split BLUETOOTH_SCAN/ADVERTISE/CONNECT apply, and neverForLocation
+         on BLUETOOTH_SCAN keeps the scan location-free (identity is the nodeId, RSSI is proximity-only). On
+         API 29-30 those don't exist: legacy BLUETOOTH/BLUETOOTH_ADMIN (normal, auto-granted) drive the radio
+         and the scan rides ACCESS_FINE_LOCATION (declared above). The legacy pair is capped at 30 so 31+ uses
+         only the split perms. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <!-- Two camera surfaces, both CameraX (see ui/camera/ for the shared permission gate): QR identity
+         verification (scan a peer's key, ui/scan/) and taking a photo to send from inside a chat
+         (ui/camera/PhotoCaptureContent.kt). required=false because a camera-less device can still *show*
+         its own code for someone else to scan and can still attach a photo from the picker; both surfaces
+         probe FEATURE_CAMERA_ANY at runtime and surface an explanatory message instead. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+
+    <!-- Voice notes: record audio in the chat composer (ui/voice/). The bytes go from MediaRecorder straight
+         into the encrypted blob store over a pipe, never a file, per ADR 029. required=false because a
+         device with no microphone can still receive and play voice notes; the composer probes
+         FEATURE_MICROPHONE at runtime and simply omits the mic button. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- Always-on mesh foreground service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Direct Wi-Fi file transfer (transfer/): a partial wake lock keeps a multi-minute transfer running with
+         the screen off, held only between hosting/joining the one-shot group and releasing it. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Restart the mesh foreground service after a device reboot (see .mesh.BootReceiver). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- enableOnBackInvokedCallback is declared rather than inherited: the platform defaults it to true only
+         for apps targeting 35+, and only on a framework that knows that rule, so an undeclared app runs the
+         predictive back dispatcher on Android 15+ and the legacy onBackPressed path on 13/14 — two back
+         implementations split by OS version, of which we only ever tested one. Measured (ADR 2026-09.un9n):
+         on Android 14 without this, navigating in and out of a chat logs no OnBackInvokedCallback churn at
+         all; with it, the same navigation registers and unregisters one per destination exactly as a Pixel
+         on 17 does. Compose's BackHandler and Navigation's own handler both ride the dispatcher either way,
+         and we override no onBackPressed. -->
+    <application
+        android:name=".KnitApplication"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:enableOnBackInvokedCallback="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Knit">
+        <!-- The backup-restore trampoline: a second process that kills the main one and relaunches it, so the
+             staged restore is applied by a process that has nothing open (ui/backup/RestartActivity). It is
+             never shown — no UI, translucent, out of recents — and KnitApplication.onCreate returns at once in
+             a process with this name, so no Koin graph or DataStore is ever opened here. -->
+        <activity
+            android:name=".ui.backup.RestartActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:process=":restart"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.Knit"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- System share sheet: receive text, an image, or any other single file from another app
+                 (ACTION_SEND). The grant ride-along on EXTRA_STREAM lets us read the stream via
+                 ContentResolver with no storage permission. singleTask re-delivers shares to onNewIntent
+                 when running. */* was added with arbitrary-file attachments (ADR 2026-09.qq2r) — it is the
+                 same inbound-READ exposure the image filter already carried, not the inbound-WRITABLE
+                 FileProvider path ADR 029 declined; a shared file is only sendable in a DM or group, which
+                 MainActivity.handleShareIntent and ChatScreen enforce between them. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <!-- Contact links (docs/CONTACT_CARD.md): https://getknit.app/c#<card> — the card rides the
+                 fragment, which never reaches the server. autoVerify needs getknit.app to publish
+                 /.well-known/assetlinks.json listing BOTH signing certificates (Play App Signing and the
+                 distribution key F-Droid/GitHub/offline-share installs carry — see
+                 .agents/context/distribution.md); until it does, Android 12+ opens the link in the browser,
+                 whose landing page offers the knit:// form below. singleTask re-delivers to onNewIntent. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data
+                    android:host="getknit.app"
+                    android:path="/c"
+                    android:scheme="https" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data
+                    android:host="c"
+                    android:scheme="knit" />
+            </intent-filter>
+            <!-- Relay invites (docs/RELAY_INVITE.md): https://getknit.app/r#<invite> — the invite rides the
+                 fragment for the same reason a card does, and more so: it carries a spool's bearer token.
+                 Same assetlinks prerequisite and the same knit:// fallback as the card's filters above. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data
+                    android:host="getknit.app"
+                    android:path="/r"
+                    android:scheme="https" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data
+                    android:host="r"
+                    android:scheme="knit" />
+            </intent-filter>
+        </activity>
+
+        <!-- Two types declared, chosen at runtime by mesh/MeshService.kt's meshForegroundServiceTypes: `location`
+             is passed only on API 29-32, the tiers where ui/Permissions.kt rides the location grant (the
+             Wi-Fi Aware publish/subscribe are gated on the foreground-only location app-op there, and only a
+             location-typed foreground service keeps that access off screen; ADR 2026-09.535d). On 34+ only
+             `connectedDevice` is ever passed, so the FOREGROUND_SERVICE_LOCATION permission lint wants for the
+             manifest attribute is never checked by the platform and is deliberately not declared: it would put
+             a location foreground service on Play's declaration form for a type this app never uses there. -->
+        <service
+            android:name=".mesh.MeshService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|location"
+            tools:ignore="ForegroundServicePermission" />
+
+        <!-- Restart the always-on mesh after a device reboot, unless the user manually stopped it
+             (mesh_enabled=false). BOOT_COMPLETED is delivered post-unlock, so the credential-encrypted
+             settings DataStore is readable, and its receipt is an exemption to the background
+             foreground-service-start restrictions; connectedDevice is a boot-permitted FGS type.
+             exported=true because the system delivers this from outside the app; BOOT_COMPLETED is a
+             protected broadcast that only the system can send. -->
+        <receiver
+            android:name=".mesh.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Message-notification quick actions (inline Reply, Mark read) + swipe-away dismiss. Not exported:
+             only the system delivers these PendingIntents (Reply rides a MUTABLE one carrying RemoteInput). -->
+        <receiver
+            android:name=".notifications.NotificationActionReceiver"
+            android:exported="false" />
+
+        <!-- Hands our own APK to the system share sheet (Quick Share / Bluetooth) so a user can pass
+             Knit to a nearby phone offline. Outbound only; the receiver's OS installs it. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+
+</manifest>

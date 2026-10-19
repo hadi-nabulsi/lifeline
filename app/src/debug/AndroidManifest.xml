@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug-only overlay: registers the DebugBridgeReceiver so an automation agent can drive the app
+     over `adb shell am broadcast` (send messages, read state). The manifest merger folds this in for
+     debug variants only, so neither the receiver nor this entry ships in a release build. Exported so
+     the `shell` uid (adb) can deliver to it; debug-only, so an exported custom-action receiver is fine.
+
+     usesCleartextTraffic is the bench affordance for the spool (Internet-relay) plane: knit-spool
+     terminates no TLS of its own (that is a reverse-proxy job), so a LAN daemon is reachable only over
+     plain `ws://`. DEBUG BUILDS ONLY — `staging` inherits `release`, has no source-set overlay here, and
+     the dialer itself refuses any non-`wss://` URL unless BuildConfig.DEBUG, so no shipped artifact can
+     be pointed at a plaintext relay however its settings are edited. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application android:usesCleartextTraffic="true">
+        <receiver
+            android:name="app.getknit.knit.debug.DebugBridgeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="app.getknit.knit.debug.SEND" />
+                <action android:name="app.getknit.knit.debug.SENDIMG" />
+                <action android:name="app.getknit.knit.debug.SAVEATT" />
+                <action android:name="app.getknit.knit.debug.STATE" />
+                <action android:name="app.getknit.knit.debug.STORE" />
+                <action android:name="app.getknit.knit.debug.REACT" />
+                <action android:name="app.getknit.knit.debug.TYPING" />
+                <action android:name="app.getknit.knit.debug.SHAREAPK" />
+                <action android:name="app.getknit.knit.debug.HEAL" />
+                <action android:name="app.getknit.knit.debug.PAUSE" />
+                <action android:name="app.getknit.knit.debug.RESUME" />
+                <action android:name="app.getknit.knit.debug.NANFAIL" />
+                <action android:name="app.getknit.knit.debug.NANSTORM" />
+                <action android:name="app.getknit.knit.debug.NANREFUSE" />
+                <action android:name="app.getknit.knit.debug.NANICM" />
+                <action android:name="app.getknit.knit.debug.NANDIAL" />
+                <action android:name="app.getknit.knit.debug.NANINIT" />
+                <action android:name="app.getknit.knit.debug.NANMSG" />
+                <action android:name="app.getknit.knit.debug.BLECAP" />
+                <action android:name="app.getknit.knit.debug.NANOFF" />
+                <action android:name="app.getknit.knit.debug.PHY" />
+                <action android:name="app.getknit.knit.debug.LINKTUNE" />
+                <action android:name="app.getknit.knit.debug.WEBPPROBE" />
+                <action android:name="app.getknit.knit.debug.WEBPCONV" />
+                <action android:name="app.getknit.knit.debug.WEBPCHECK" />
+                <action android:name="app.getknit.knit.debug.REQNOTIF" />
+                <action android:name="app.getknit.knit.debug.MSGNOTIF" />
+                <action android:name="app.getknit.knit.debug.FLAGMSG" />
+                <action android:name="app.getknit.knit.debug.MKGROUP" />
+                <action android:name="app.getknit.knit.debug.LEAVE" />
+                <action android:name="app.getknit.knit.debug.REVIEW" />
+                <action android:name="app.getknit.knit.debug.MODEL" />
+                <action android:name="app.getknit.knit.debug.SPOOL" />
+                <action android:name="app.getknit.knit.debug.COMMONS" />
+                <action android:name="app.getknit.knit.debug.INTRO" />
+                <action android:name="app.getknit.knit.debug.RATCHET" />
+                <action android:name="app.getknit.knit.debug.LORA" />
+                <action android:name="app.getknit.knit.debug.LORATX" />
+                <action android:name="app.getknit.knit.debug.LORAPROV" />
+                <action android:name="app.getknit.knit.debug.XFER" />
+                <action android:name="app.getknit.knit.debug.BACKUP" />
+                <action android:name="app.getknit.knit.debug.PURGE" />
+                <action android:name="app.getknit.knit.debug.RESETDB" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

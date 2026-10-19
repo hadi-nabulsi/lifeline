@@ -1,0 +1,102 @@
+# Project detekt config — a thin OVERLAY on detekt's bundled defaults (applied with
+# `buildUponDefaultConfig = true` in app/build.gradle.kts; CI `verify:detekt` runs `./gradlew detekt`).
+# Only rules whose defaults misfire on this Jetpack Compose + Koin codebase are listed; everything else
+# keeps detekt's bundled defaults. Goal: silence framework-shaped false positives so the report is
+# signal, not noise. Genuine nits are fixed in code instead (see the MR that introduced this file).
+#
+# Uses the detekt 2.0 config schema: LongParameterList's constructorThreshold/functionThreshold are now
+# allowedConstructorParameters/allowedFunctionParameters; TooManyFunctions' thresholdIn* are now
+# allowedFunctionsPer*; and the style rule UnusedImports is now the singular UnusedImport.
+#
+# Rationale per rule:
+#  - @Composable functions are PascalCase by Compose convention, are naturally long (declarative UI
+#    trees), and take many hoisted-state/callback params — so FunctionNaming/LongMethod/LongParameterList/
+#    CyclomaticComplexMethod/TooManyFunctions exempt them.
+#  - Koin DI constructors legitimately take one param per injected collaborator (MeshManager/ChatViewModel
+#    have 10) — raise the allowed constructor params rather than inventing parameter-objects that just
+#    relocate wiring.
+#  - The mesh orchestrator (MeshManager, 31 fns) and the single GMS adapter (NearbyTransport, 14 fns) are
+#    by-design per AGENTS.md — raise the per-class function allowance rather than split them.
+#  - MagicNumber: theme color/typography literals live in property declarations; ignore those.
+#  - ReturnCount: the flagged functions are guard-clause early-returns (some lint-mandated).
+#  - ForbiddenImport: bans android.graphics.BitmapFactory outside data/ImageDecode.kt, so an unbounded
+#    decode of peer-supplied image bytes can't reappear (ADR 051). It is an *import* rule rather than
+#    ForbiddenMethodCall because detekt runs here without type resolution, which that rule requires.
+#    scripts/dex-bitmap-gate.sh is the matching check on the release dex, where library code is visible.
+
+complexity:
+  CyclomaticComplexMethod:
+    ignoreAnnotated: ['Composable']
+  LongMethod:
+    ignoreAnnotated: ['Composable']
+  LongParameterList:
+    ignoreAnnotated: ['Composable']
+    allowedConstructorParameters: 15   # Koin DI constructors (ChatViewModel = 14 args incl. group repo + avatar store)
+    allowedFunctionParameters: 8       # the 6-arg Notifier functions are fine
+  TooManyFunctions:
+    ignoreAnnotatedFunctions: ['Composable', 'Preview']  # Compose screen files are many small composables
+    allowedFunctionsPerClass: 65       # MeshManager 31 (+ content-moderation gate), MeshMetrics 59 (one fn per counter, +LoRa), ChatViewModel 65 (one screen's every action)
+    allowedFunctionsPerFile: 20
+    allowedFunctionsPerObject: 15
+    allowedFunctionsPerInterface: 14   # Notifier: one method per notification kind, plus its visibility/dismissal hooks
+
+naming:
+  FunctionNaming:
+    ignoreAnnotated: ['Composable']
+
+style:
+  UnusedImport:
+    active: true                           # not in detekt's default-on set; we want dead imports caught in CI
+  ForbiddenImport:
+    active: true                           # also off by default; ADR 051 — see the header note
+    # One excludes list serves every pattern below, so the two OkHttp files are also exempt from the
+    # BitmapFactory ban here; scripts/dex-bitmap-gate.sh still enforces that one on the release dex.
+    excludes:
+      - '**/data/ImageDecode.kt'                 # the one file allowed to decode
+      - '**/mesh/spool/OkHttpSpoolDialer.kt'     # the spool plane's socket (rules/mesh.md)
+      - '**/mesh/spool/OkHttpSpoolDialerSocketTest.kt' # ...and its MockWebServer test, whose fake spool is an okhttp3.WebSocketListener
+      - '**/linkpreview/OkHttpPreviewFetcher.kt' # the link-preview fetch (rules/mesh.md)
+      - '**/location/AndroidLocationSource.kt'   # the one android.location importer (shares the list, so also exempt from the two bans above)
+      - '**/transfer/AndroidDirectWifi.kt'       # the one android.net.wifi.p2p importer (direct file transfer)
+      - '**/ui/DeviceSupervision.kt'             # the one android.app.admin / UserManager importer (ADR 2026-09.a8ud)
+      - '**/ui/DeviceSupervisionTest.kt'         # ...and its Robolectric test, which sets the shadows up
+    forbiddenImports:
+      - value: 'android.graphics.BitmapFactory'
+        reason: >-
+          Decode through data/ImageDecode.kt (decodeOrientedBounded / decodeBoundedFromBytes) so every
+          decode is inSampleSize-bounded. A bare BitmapFactory.decode* call trusts the image's own pixel
+          dimensions, which for anything off the mesh is attacker-chosen. ADR 051.
+      - value: 'okhttp3.*'
+        reason: >-
+          OkHttp is confined to mesh/spool/OkHttpSpoolDialer.kt and linkpreview/OkHttpPreviewFetcher.kt
+          (rules/mesh.md): each sits behind a pure seam (SpoolLink/SpoolSocket; PreviewFetcher) so everything
+          above it runs against an in-process fake, and the app's whole Internet surface stays two files.
+      - value: 'android.net.wifi.p2p.*'
+        reason: >-
+          Wi-Fi Direct is driven from transfer/AndroidDirectWifi.kt and nowhere else, behind the DirectWifi seam:
+          it is what pauses and resumes the Wi-Fi Aware plane around a group, so a second importer would be a
+          second place the mesh radio could be taken without being handed back.
+      - value: 'android.location.*'
+        reason: >-
+          The device's position is read in location/AndroidLocationSource.kt and nowhere else, behind the
+          LocationSource seam: the only collector is the composer's staged tile, between the pin tap and the
+          send, so a second importer would be a second place the app could read where the user is.
+      - value: 'android.app.admin.*'
+        reason: >-
+          Who administers the phone is read in ui/DeviceSupervision.kt and nowhere else, as one three-position
+          enum: the answer only ever names a parent or an administrator in copy, and a second reader would be a
+          second place to get the policy question subtly wrong. ADR 2026-09.a8ud.
+      - value: 'android.os.UserManager'
+        reason: >-
+          Same file, same reason as android.app.admin.* — the user-restriction read is half of that probe.
+  MagicNumber:
+    ignorePropertyDeclaration: true        # theme/Color.kt + Type.kt literals
+    ignoreLocalVariableDeclaration: true
+    ignoreNamedArgument: true
+    ignoreRanges: true                     # self-evident range buckets, e.g. `in 2L..6L` in RelativeTime
+    ignoreAnnotated: ['Composable']
+  MaxLineLength:
+    maxLineLength: 140                      # the codebase style runs to ~130
+  ReturnCount:
+    max: 4
+    excludeGuardClauses: true

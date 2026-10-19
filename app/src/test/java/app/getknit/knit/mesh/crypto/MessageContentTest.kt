@@ -1,0 +1,398 @@
+package app.getknit.knit.mesh.crypto
+
+import app.getknit.knit.data.message.MentionStore
+import app.getknit.knit.data.message.MessageEntity
+import app.getknit.knit.data.message.withReply
+import app.getknit.knit.mesh.protocol.GroupInfo
+import app.getknit.knit.mesh.protocol.GroupKeyPayload
+import app.getknit.knit.mesh.protocol.GroupRootPayload
+import app.getknit.knit.mesh.protocol.GroupSeed
+import app.getknit.knit.mesh.protocol.Mention
+import app.getknit.knit.mesh.protocol.ProfilePayload
+import app.getknit.knit.mesh.protocol.ReactionPayload
+import app.getknit.knit.mesh.protocol.ReplyRef
+import app.getknit.knit.mesh.protocol.TransferPayload
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.descriptors.elementNames
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/** The plaintext content schema: CBOR round-trip and the delivery-time version gate (unknown → dropped). */
+class MessageContentTest {
+    @Test
+    fun encodeThenDecodeRoundTripsEveryField() {
+        val original =
+            MessageContent(
+                body = "hi",
+                mentions = listOf(Mention("bob00000", "Bob")),
+                attachmentHash = "hash",
+                attachmentMime = "image/jpeg",
+                attachmentKey = "key",
+            )
+        val decoded = MessageContent.decode(original.encode())!!
+        assertEquals("hi", decoded.body)
+        assertEquals(listOf(Mention("bob00000", "Bob")), decoded.mentions)
+        assertEquals("hash", decoded.attachmentHash)
+        assertEquals("image/jpeg", decoded.attachmentMime)
+        assertEquals("key", decoded.attachmentKey)
+    }
+
+    /**
+     * #131's drift guard. [sealedContent] is the one builder sendChat and the re-seal share; a conversational field
+     * added to [MessageContent] and left out of it seals on neither path, and one added by hand to only one of two
+     * builders is how the re-seal lost a file's name. Every field of the class either comes off a fully populated
+     * row or is named in [MACHINERY].
+     */
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
+    fun theSealedContentOfARowMapsEveryConversationalField() {
+        val row =
+            MessageEntity(
+                id = "m1",
+                senderId = "alice000",
+                recipientId = "bob00000",
+                body = "the report",
+                sentAt = 1_000L,
+                mentions = MentionStore.encode(listOf(Mention("bob00000", "Bob"))),
+                attachmentHash = "cipher-hash",
+                attachmentMime = "application/pdf",
+                attachmentKey = "key",
+                attachmentName = "quarterly-report.pdf",
+                attachmentSize = 1_400_000L,
+            ).withReply(ReplyRef(messageId = "m0", authorId = "bob00000", author = "Bob", snippet = "send it?"))
+
+        val content = row.sealedContent()
+        val emitted =
+            JSON
+                .encodeToJsonElement(MessageContent.serializer(), content)
+                .jsonObject.keys
+        val fields =
+            MessageContent
+                .serializer()
+                .descriptor.elementNames
+                .toSet()
+
+        assertEquals(
+            "a new conversational field must be mapped in MessageEntity.sealedContent, or listed in MACHINERY",
+            fields - MACHINERY,
+            emitted,
+        )
+        assertEquals("quarterly-report.pdf", content.attachmentName)
+        assertEquals(1_400_000L, content.attachmentSize)
+        assertEquals(listOf(Mention("bob00000", "Bob")), content.mentions)
+        assertEquals("m0", content.replyTo?.messageId)
+    }
+
+    @Test
+    fun theCurrentVersionIsSupported() {
+        assertTrue(MessageContent(body = "hi").isSupported()) // v defaults to VERSION
+    }
+
+    @Test
+    fun aFutureContentSchemaVersionIsNotSupported() {
+        assertFalse(MessageContent(v = MessageContent.MAX_SUPPORTED + 1, body = "hi").isSupported())
+    }
+
+    @Test
+    fun decodingGarbageReturnsNullRatherThanThrowing() {
+        assertNull(MessageContent.decode(byteArrayOf(1, 2, 3, 4)))
+    }
+
+    @Test
+    fun theControlMarkerRoundTripsAndDefaultsToNull() {
+        // Additive field under the same schema version: a v1-era decoder ignores it, an ordinary
+        // message omits it (encodeDefaults = false), and a reset frame carries it inside the ciphertext.
+        val reset = MessageContent.decode(MessageContent(body = "", ctl = MessageContent.CTL_SESSION_RESET).encode())!!
+        assertEquals(MessageContent.CTL_SESSION_RESET, reset.ctl)
+        assertTrue(reset.isSupported())
+        assertNull(MessageContent.decode(MessageContent(body = "hi").encode())!!.ctl)
+    }
+
+    @Test
+    fun theGroupKeyPayloadRoundTripsThroughEveryCtlShape() {
+        val seed = GroupSeed(epoch = 3, seed = ByteArray(32) { 5 }, mintedAt = 77L)
+        val dist =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_GROUP_KEY, gk = GroupKeyPayload("g-1", keys = listOf(seed))).encode(),
+            )!!
+        assertEquals(MessageContent.CTL_GROUP_KEY, dist.ctl)
+        assertEquals("g-1", dist.gk?.groupId)
+        assertEquals(
+            3,
+            dist.gk
+                ?.keys
+                ?.single()
+                ?.epoch,
+        )
+        assertEquals(
+            77L,
+            dist.gk
+                ?.keys
+                ?.single()
+                ?.mintedAt,
+        )
+        assertTrue(
+            ByteArray(32) { 5 }.contentEquals(
+                dist.gk!!
+                    .keys
+                    .single()
+                    .seed,
+            ),
+        )
+
+        val req =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_GROUP_KEY_REQ, gk = GroupKeyPayload("g-1")).encode(),
+            )!!
+        assertEquals(MessageContent.CTL_GROUP_KEY_REQ, req.ctl)
+        assertTrue(req.gk!!.keys.isEmpty())
+
+        val ack =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_GROUP_KEY_ACK, gk = GroupKeyPayload("g-1", ackEpoch = 3)).encode(),
+            )!!
+        assertEquals(3, ack.gk?.ackEpoch)
+
+        // An ordinary message carries no gk (encodeDefaults = false keeps it off the wire entirely).
+        assertNull(MessageContent.decode(MessageContent(body = "hi").encode())!!.gk)
+
+        // A seed distribution carries no root unless one is gossiped alongside it, and no roster unless the
+        // sender attached its founding one.
+        assertNull(dist.gk.gr)
+        assertNull(dist.gk.group)
+    }
+
+    @Test
+    fun theFoundingRosterRidesTheKeyCtlBesideSeedsAndRoot() {
+        // Work item #47: the roster half of GroupInfo (no photo) on the same ctl DM as the seeds and the
+        // root, so a member holding no row can pin the group from the seed itself.
+        val roster =
+            GroupInfo(
+                id = "g-1",
+                name = "Team",
+                members = listOf("aaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                createdBy = "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                departed = listOf("cccccccccccccccccccccccccc"),
+            )
+        val dist =
+            MessageContent.decode(
+                MessageContent(
+                    body = "",
+                    ctl = MessageContent.CTL_GROUP_KEY,
+                    gk =
+                        GroupKeyPayload(
+                            "g-1",
+                            keys = listOf(GroupSeed(epoch = 4, seed = ByteArray(32) { 1 }, mintedAt = 88L)),
+                            gr = GroupRootPayload(root = ByteArray(32) { 9 }, version = 1, minter = "aaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                            group = roster,
+                        ),
+                ).encode(),
+            )!!
+        assertEquals(roster, dist.gk?.group)
+        assertEquals(
+            4,
+            dist.gk
+                ?.keys
+                ?.single()
+                ?.epoch,
+        )
+        assertEquals(1, dist.gk?.gr?.version)
+
+        // A root-only gossip carries it too: the shape a member with a root but no send chain emits.
+        val rootOnly =
+            MessageContent.decode(
+                MessageContent(
+                    body = "",
+                    ctl = MessageContent.CTL_GROUP_KEY,
+                    gk =
+                        GroupKeyPayload(
+                            "g-1",
+                            gr = GroupRootPayload(root = ByteArray(32) { 9 }, version = 1, minter = "aaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                            group = roster,
+                        ),
+                ).encode(),
+            )!!
+        assertTrue(rootOnly.gk!!.keys.isEmpty())
+        assertEquals(roster, rootOnly.gk.group)
+    }
+
+    @Test
+    fun theGroupRootRidesTheKeyCtlWithAndWithoutSeeds() {
+        // The root-only distribution (docs/SPOOL_PROTOCOL.md §3.2): `keys` empty is the normal shape for a
+        // member that holds a root but has never sealed a group frame, so `gr` must survive it — a receiver
+        // that adopts roots only inside its seed branch would drop exactly these.
+        val root = GroupRootPayload(root = ByteArray(32) { 9 }, version = 2, minter = "bbbbbbbbbbbbbbbbbbbbbbbbbb")
+        val rootOnly =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_GROUP_KEY, gk = GroupKeyPayload("g-1", gr = root)).encode(),
+            )!!
+        assertTrue(rootOnly.gk!!.keys.isEmpty())
+        assertEquals(2, rootOnly.gk.gr?.version)
+        assertEquals("bbbbbbbbbbbbbbbbbbbbbbbbbb", rootOnly.gk.gr?.minter)
+        assertTrue(ByteArray(32) { 9 }.contentEquals(rootOnly.gk.gr!!.root))
+
+        // ...and the ordinary shape: seeds and root together on one ctl DM.
+        val both =
+            MessageContent.decode(
+                MessageContent(
+                    body = "",
+                    ctl = MessageContent.CTL_GROUP_KEY,
+                    gk =
+                        GroupKeyPayload(
+                            "g-1",
+                            keys = listOf(GroupSeed(epoch = 4, seed = ByteArray(32) { 1 }, mintedAt = 88L)),
+                            gr = root,
+                        ),
+                ).encode(),
+            )!!
+        assertEquals(
+            4,
+            both.gk
+                ?.keys
+                ?.single()
+                ?.epoch,
+        )
+        assertEquals(2, both.gk?.gr?.version)
+    }
+
+    @Test
+    fun theReceiptCtlRoundTripsWithItsAckId() {
+        val receipt =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_RECEIPT, ack = "m-42").encode(),
+            )!!
+        assertEquals(MessageContent.CTL_RECEIPT, receipt.ctl)
+        assertEquals("m-42", receipt.ack)
+        assertTrue(receipt.isSupported()) // additive fields, same schema version
+        assertNull(MessageContent.decode(MessageContent(body = "hi").encode())!!.ack)
+    }
+
+    @Test
+    fun theReactionCtlRoundTripsIncludingRetraction() {
+        val reaction =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_REACTION, rp = ReactionPayload("m-42", "👍")).encode(),
+            )!!
+        assertEquals(MessageContent.CTL_REACTION, reaction.ctl)
+        assertEquals("m-42", reaction.rp?.messageId)
+        assertEquals("👍", reaction.rp?.emoji)
+
+        // A retraction is emoji = null INSIDE a present rp — distinguishable from "no reaction payload"
+        // because rp itself is non-null (encodeDefaults = false omits the null emoji key, and a missing
+        // key decodes back to null; no reaction legitimately has no emoji, so the shape is unambiguous).
+        val retraction =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_REACTION, rp = ReactionPayload("m-42")).encode(),
+            )!!
+        assertEquals("m-42", retraction.rp?.messageId)
+        assertNull(retraction.rp?.emoji)
+        assertNull(MessageContent.decode(MessageContent(body = "hi").encode())!!.rp)
+    }
+
+    @Test
+    fun theProfileCtlRoundTripsAndCarriesItsOwnVersion() {
+        val update =
+            MessageContent.decode(
+                MessageContent(
+                    body = "",
+                    ctl = MessageContent.CTL_PROFILE,
+                    pr = ProfilePayload(name = "Ann", status = "hiking", avatarHash = "av1", version = 1_700L),
+                ).encode(),
+            )!!
+        assertEquals(MessageContent.CTL_PROFILE, update.ctl)
+        assertEquals("Ann", update.pr?.name)
+        assertEquals("hiking", update.pr?.status)
+        assertEquals("av1", update.pr?.avatarHash)
+        // The version rides in the payload, not the carrying frame's sentAt: it is the one number the
+        // sealed and cleartext profile paths both order against.
+        assertEquals(1_700L, update.pr?.version)
+        assertTrue(update.isSupported()) // additive field, same schema version
+        assertNull(MessageContent.decode(MessageContent(body = "hi").encode())!!.pr)
+
+        // Avatar cleared, and the ctl value is 8 — 7 stays reserved for CTL_SCOPE_CONFIG, and ctl
+        // numbers are append-only.
+        val cleared =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_PROFILE, pr = ProfilePayload("Ann", "", version = 2L)).encode(),
+            )!!
+        assertNull(cleared.pr?.avatarHash)
+        assertEquals(8, MessageContent.CTL_PROFILE)
+    }
+
+    @Test
+    fun aPlainMessageEncodingIsByteIdenticalWithTheNewFieldsDefaulted() {
+        // WIRE_COMPAT rule 1 proof for the ack/rp/acks additions: an ordinary message's bytes are
+        // unchanged by the new nullable fields (encodeDefaults = false), so pre-change golden vectors —
+        // and every deployed build's expectations — still hold. Pinned against the hand-computed CBOR of
+        // {"body": "hi"}: definite-length map, one text key, one text value.
+        val plain = MessageContent(body = "hi").encode()
+        assertTrue(
+            byteArrayOf(
+                0xA1.toByte(),
+                0x64,
+                'b'.code.toByte(),
+                'o'.code.toByte(),
+                'd'.code.toByte(),
+                'y'.code.toByte(),
+                0x62,
+                'h'.code.toByte(),
+                'i'.code.toByte(),
+            ).contentEquals(plain),
+        )
+    }
+
+    @Test
+    fun theReceiptCtlRoundTripsWithBatchedAcks() {
+        // The custody-escalated group tick: one sealed frame acking many ids (docs/
+        // ENCRYPTED_RECEIPTS_REACTIONS.md §2). Order is preserved, the single-ack field stays null on
+        // a batch, and an ordinary message decodes acks null (additive under the same schema version).
+        val batch =
+            MessageContent.decode(
+                MessageContent(body = "", ctl = MessageContent.CTL_RECEIPT, acks = listOf("m1", "m2", "m3")).encode(),
+            )!!
+        assertEquals(MessageContent.CTL_RECEIPT, batch.ctl)
+        assertEquals(listOf("m1", "m2", "m3"), batch.acks)
+        assertNull(batch.ack)
+        assertTrue(batch.isSupported())
+        assertNull(MessageContent.decode(MessageContent(body = "hi").encode())!!.acks)
+    }
+
+    @Test
+    fun theTransferPayloadRoundTripsEveryFieldAndNormalizesItsName() {
+        val ready =
+            TransferPayload(
+                id = "t1",
+                phase = TransferPayload.PHASE_READY,
+                name = "evil\u202Efdp.exe",
+                size = 4_000_000_000L,
+                mime = "application/octet-stream",
+                ssid = "DIRECT-ab-cdefghij",
+                passphrase = "p".repeat(24),
+                port = 45_000,
+                key = "k".repeat(44),
+                reason = TransferPayload.REASON_BUSY,
+            )
+        val decoded = MessageContent.decode(MessageContent(body = "", ctl = MessageContent.CTL_TRANSFER, xf = ready).encode())!!
+        assertEquals(MessageContent.CTL_TRANSFER, decoded.ctl)
+        // Sender-supplied text is brought inside AttachmentName's rules at the decode boundary, like attachmentName.
+        assertEquals(ready.copy(name = "evilfdp.exe"), decoded.xf)
+        assertNull(MessageContent.decode(MessageContent(body = "hi").encode())!!.xf)
+    }
+
+    private companion object {
+        /**
+         * The [MessageContent] fields a stored message row never carries: the schema version (elided while it equals
+         * [MessageContent.VERSION]) and the ctl machinery. A new conversational field must be mapped in
+         * [sealedContent]; only a new machinery field belongs here.
+         */
+        val MACHINERY = setOf("v", "ctl", "gk", "ack", "rp", "pr", "acks", "xf")
+
+        /** Omits what equals its default, as the CBOR codec does, so the keys left are the fields the row filled. */
+        val JSON = Json { encodeDefaults = false }
+    }
+}

@@ -1,0 +1,1663 @@
+package app.getknit.knit.mesh
+
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * Why an inbound frame we wanted was dropped — distinct from policy drops (blocked sender / moderation),
+ * which are NOT counted here so a staged rollout's drop dashboard stays a pure "couldn't use it" signal.
+ * Surfaced in [MeshMetrics.Snapshot.Frames.dropsByReason] for the Diagnostics screen + the periodic metrics log.
+ */
+enum class DropReason {
+    /** Bytes that wouldn't decode into a frame (malformed, or an unknown wrapper/envelope shape). */
+    DECODE_FAILED,
+
+    /** A payload from an endpoint we have no node-id mapping for. */
+    UNKNOWN_ENDPOINT,
+
+    /** The frame signature didn't verify against the sender's key. */
+    SIG_INVALID,
+
+    /** No pinned key for the sender yet (their profile hasn't arrived), so we can't authenticate it. */
+    NO_SENDER_KEY,
+
+    /** The verifying key doesn't derive to the claimed senderId (self-cert failure / stale pin). */
+    KEY_NODEID_MISMATCH,
+
+    /** Signature verification threw unexpectedly. */
+    VERIFY_ERROR,
+
+    /** An encrypted message we couldn't decrypt (no wrapped key for us, or AEAD failure). */
+    DECRYPT_FAILED,
+
+    /** A relayed message we declined to carry for store-and-forward (unauthenticated). */
+    CARRY_REFUSED,
+
+    /** An encrypted envelope whose crypto-scheme version this build doesn't support. */
+    UNKNOWN_ENVELOPE_VERSION,
+
+    /** A decrypted payload whose content-schema version this build doesn't support. */
+    UNKNOWN_CONTENT_VERSION,
+
+    /** An inbound profile whose key differs from the sender's already-pinned key — a pinned-key change
+     *  is only reachable via a nodeId hash collision (impersonation), so we refuse it and keep the pin. */
+    PIN_CHANGE_REFUSED,
+
+    /** A v2 (ratchet) DM with no session and no attached init — the peer assumes state we don't have. */
+    RATCHET_NO_SESSION,
+
+    /** A v2 DM referencing an own epoch or prekey private we no longer hold (retired/pruned/wiped). */
+    RATCHET_EPOCH_GONE,
+
+    /** A v2 DM whose chain index was already consumed and no skipped key is held — a benign re-delivery. */
+    RATCHET_DUPLICATE,
+
+    /** A v2 envelope with a structurally invalid ratchet header (missing `r`, bound violations, group-addressed). */
+    RATCHET_BAD_HEADER,
+
+    /**
+     * A v2 DM whose key material resolved but whose AEAD refused — the peer holds a session with us and we
+     * with them, and the two roots disagree (a "split brain"). Broken out of the generic [DECRYPT_FAILED],
+     * which also covers the v1 path, because this is the one ratchet failure that means *both* sides have
+     * state: [RATCHET_NO_SESSION] and [RATCHET_EPOCH_GONE] say we are missing something, and both already
+     * drive the reset heuristic. Without its own reason this deadlocked silently — neither side could
+     * decrypt, neither asked for a reset, and the pair re-served the same undecryptable custody forever.
+     */
+    RATCHET_AEAD_FAIL,
+
+    /** A group frame CLAIMING US whose roster failed vetting (unverifiable founding set, smuggled
+     *  member, non-founding sender, oversized roster) — see `InboundPipeline.vetRoster`. Frames for
+     *  groups we simply aren't in are refused silently (that is every relayed foreign-group frame). */
+    GROUP_ROSTER_REFUSED,
+
+    /** A group ratchet frame with no adopted seed for its (sender, epoch) — the seed DM hasn't arrived/was lost. */
+    GROUP_RATCHET_NO_KEY,
+
+    /** A group ratchet frame whose chain index was already consumed — a benign custody re-delivery. */
+    GROUP_RATCHET_DUPLICATE,
+
+    /** A group-form envelope that is header-less, not group-addressed, or bound-violating — malformed by construction. */
+    GROUP_RATCHET_BAD_HEADER,
+
+    /** Group key material present but wrong (stale/foreign mint era) — the post-wipe signal, never tamper. */
+    GROUP_RATCHET_AEAD_FAIL,
+
+    /**
+     * An unsigned frame that was not the one shape the unsigned door admits — a `relay = false` v3 DM-form
+     * `CTL_RECEIPT` addressed to us (ADR 059) — or one that was, but did not open. Its own reason, kept
+     * apart from [SIG_INVALID], because an old build overhearing a v3 tick counts the latter and this must
+     * stay a clean "nothing legitimate looks like this" signal.
+     */
+    UNSIGNED_REFUSED,
+
+    /**
+     * An inbound reaction, cleartext or sealed, whose emoji is blank or longer than `TextLimits.REACTION`
+     * — nothing is applied locally, while the frame is still custodied and relayed (cleartext) or its
+     * ratchet chain still advances (sealed): a size gate is a delivery gate, never a relay gate.
+     */
+    REACTION_REFUSED,
+
+    /**
+     * A broadcast-room post over the link's ingress budget ([IngressBudget]) — refused in [MeshRouter] before
+     * verify, custody, delivery and relay, and never marked seen, so a custody re-serve can bring it through
+     * once the bucket refills. The one deliberate refusal counted here, because a rising count *is* the
+     * flood signal Diagnostics should show: one link handing over room posts faster than any room is written.
+     */
+    INGRESS_REFUSED,
+
+    /**
+     * A verified frame whose `payload` wouldn't decode into its type's content: a field of the wrong CBOR type, a
+     * missing required one, text that isn't UTF-8. Counted where the pipeline reads the payload, so a regressed
+     * encoder on another port shows here instead of vanishing (the interop audit's AND-12).
+     */
+    PAYLOAD_DECODE_FAILED,
+}
+
+/**
+ * Why a Bluetooth L2CAP connect attempt to a peer failed — surfaced per-reason in
+ * [MeshMetrics.Snapshot.Bluetooth.btConnectFailsByReason] and the failure log, so an intermittent "can link one peer
+ * but not the second" (the suspected BLE ↔ A2DP-audio radio contention) is *attributable* rather than a
+ * silent retry. Best-effort buckets classified from the (otherwise-discarded) connect exception; the raw
+ * throwable is always logged alongside.
+ */
+enum class ConnectFailReason {
+    /** The blocking connect() (or HELLO exchange) didn't complete before the watchdog closed the socket. */
+    TIMEOUT,
+
+    /** The Bluetooth stack reported a radio/resource error — the radio-saturation signature. */
+    RADIO,
+
+    /** The peer refused or reset the channel (advertised a PSM but isn't accepting on it). */
+    REFUSED,
+
+    /** The socket connected but the identity (HELLO) exchange failed. */
+    HANDSHAKE,
+
+    /** Any other/unclassified failure — see the logged throwable. */
+    OTHER,
+}
+
+/**
+ * Why an inbound coordination-plane fast-path message (compact `0x03` / fragment `0x04`,
+ * `mesh/link/FastFrameCodec`) was discarded. Surfaced in [MeshMetrics.Snapshot.FastPath.fastDropsByReason]:
+ * TIMEOUT/OVERFLOW climbing means fragments are being lost mid-frame (range edge, tx-queue pressure);
+ * UNKNOWN_TAG means a newer peer is emitting a tag this build doesn't know; DECODE_FAILED with any
+ * volume means a framing/dictionary mismatch (should be ~0 — the flood copy self-heals either way).
+ */
+enum class FastPathDrop {
+    /** A fragment set never completed inside the reassembly window. */
+    FRAG_TIMEOUT,
+
+    /** The bounded reassembly store evicted the oldest incomplete entry for a newer one. */
+    FRAG_OVERFLOW,
+
+    /** A non-printable first byte that is no known tag (a future peer, or garbage). */
+    UNKNOWN_TAG,
+
+    /** A tagged message that failed to parse/inflate back into a frame. */
+    DECODE_FAILED,
+
+    /**
+     * A transcoded (`0x05`, ADR 060) message would not decode — most likely its body did not rebuild: the
+     * sender's transcoder and this build's rebuild disagree about a frame. Should be ~0; the flood copy heals it.
+     */
+    TRANSCODE_FAILED,
+}
+
+/**
+ * Why the BLE side channel (`mesh/bluetooth/BleSideChannel`, the extended-advertising page carrier) discarded
+ * a frame. Surfaced in [MeshMetrics.Snapshot.Bluetooth.bleSideDropsByReason]: STALE/OVERFLOW climbing means the pages
+ * cannot keep up with what is offered (two slots at a ~12 s dwell is the whole capacity); FRAG_TIMEOUT means
+ * a part of a multi-part frame was never heard (range edge, a scanner window that missed it); DECODE_FAILED
+ * with volume means a framing mismatch, or two senders' fragments with one id were assembled together.
+ */
+enum class BleSideDrop {
+    /** A queued frame outlived its freshness before a slot freed up. */
+    STALE,
+
+    /** The bounded queue shed its oldest unstarted frame for a newer one. */
+    OVERFLOW,
+
+    /** A page whose first byte is no tag this build knows. */
+    UNKNOWN_TAG,
+
+    /** A page (or a reassembled set) failed to decode into a frame. */
+    DECODE_FAILED,
+
+    /** A fragment set never completed inside the reassembly window. */
+    FRAG_TIMEOUT,
+
+    /** The bounded reassembly store evicted the oldest incomplete entry for a newer one. */
+    FRAG_OVERFLOW,
+
+    /** A page carrying our own frame came back (a relay of it) — never delivered to ourselves. */
+    OWN_ECHO,
+}
+
+/**
+ * Thread-safe counters for mesh transmission, so the effect of flood suppression and the CBOR wire
+ * format is measurable in the field. Pure JVM (no Android dependencies) so it can live in [mesh] and
+ * be asserted from the same unit tests as [MeshRouter].
+ *
+ * The ratio of [Snapshot.Frames.framesSuppressed] to [Snapshot.Frames.framesRelayed] shows how much redundant
+ * rebroadcasting the overhear suppression eliminates; [Snapshot.Frames.bytesSent] tracks the CBOR win;
+ * [Snapshot.Frames.dropsByReason] makes the otherwise-silent inbound drops visible during a rollout.
+ *
+ * Both size suppressions below say the same thing: this is a flat registry whose length tracks the *number
+ * of metrics*, not any complexity — one field and one tiny increment each. Splitting it would scatter the
+ * counters and break the single-[Snapshot] read every consumer (Diagnostics, the debug bridge, the metrics
+ * log line) depends on.
+ */
+@Suppress("TooManyFunctions", "LargeClass")
+class MeshMetrics {
+    private val framesOriginated = AtomicLong()
+    private val framesDelivered = AtomicLong()
+    private val framesRelayed = AtomicLong()
+    private val framesHandedOn = AtomicLong()
+    private val framesSuppressed = AtomicLong()
+    private val framesDeduped = AtomicLong()
+    private val bytesSent = AtomicLong()
+    private val keyRequestsSent = AtomicLong()
+    private val introsSent = AtomicLong()
+    private val introsAnswered = AtomicLong()
+    private val keysServed = AtomicLong()
+    private val keysRecovered = AtomicLong()
+    private val framesHeld = AtomicLong()
+    private val framesReplayed = AtomicLong()
+    private val healsCompleted = AtomicLong()
+    private val blobAsksHandled = AtomicLong()
+    private val carrierPullsDeferred = AtomicLong()
+    private val filesResumedOut = AtomicLong()
+    private val filesResumedIn = AtomicLong()
+    private val splicesRefused = AtomicLong()
+
+    // The holder query (ADR 2026-10.6e5t): one counter per [BlobExchange.BlobEvent].
+    private val blobEvents = BlobExchange.BlobEvent.entries.associateWith { AtomicLong() }
+    private val receiptsResent = AtomicLong()
+    private val dmSealedV2 = AtomicLong()
+    private val dmSealedV3 = AtomicLong()
+    private val ticksUnsigned = AtomicLong()
+    private val dmSealedV1Fallback = AtomicLong()
+    private val receiptsSealed = AtomicLong()
+    private val receiptsSealedFallback = AtomicLong()
+    private val receiptsCustodied = AtomicLong()
+    private val receiptsCoalesced = AtomicLong()
+    private val receiptsRidden = AtomicLong()
+    private val receiptsSpooled = AtomicLong()
+    private val reactionsSealed = AtomicLong()
+    private val reactionsSealedFallback = AtomicLong()
+    private val groupSealedRatchet = AtomicLong()
+    private val groupSealedV1Fallback = AtomicLong()
+    private val groupSeedsSent = AtomicLong()
+    private val groupSeedsAdopted = AtomicLong()
+    private val groupSeedsHeld = AtomicLong()
+    private val groupSeedsReplayed = AtomicLong()
+    private val groupKeyRequestsSent = AtomicLong()
+    private val groupRootsMinted = AtomicLong()
+    private val groupRootsAdopted = AtomicLong()
+
+    // Fixed key set → no allocation on the hot path, every reason always present.
+    private val drops: Map<DropReason, AtomicLong> = DropReason.entries.associateWith { AtomicLong() }
+    private val connectFails: Map<ConnectFailReason, AtomicLong> =
+        ConnectFailReason.entries.associateWith { AtomicLong() }
+    private val btLinksEstablished = AtomicLong()
+    private val nanServesPeak = AtomicLong()
+    private val nanOwedNoLinkPeakMs = AtomicLong()
+    private val nanAcceptsRefused = AtomicLong()
+    private val nanIcmKeepaliveFailed = AtomicLong()
+    private val nanOffScreenRefusals = AtomicLong()
+    private val nanMsgsAcked = AtomicLong()
+    private val nanMsgSendsFailed = AtomicLong()
+    private val nanMsgPlaneStalledPeakMs = AtomicLong()
+    private val nanMsgPlaneCycles = AtomicLong()
+    private val filesSentNan = AtomicLong()
+    private val filesSentBt = AtomicLong()
+    private val nanBulkGraceTimeouts = AtomicLong()
+    private val fastCompactSent = AtomicLong()
+    private val fastLegacySent = AtomicLong()
+    private val fastFragSent = AtomicLong()
+    private val fastReassembled = AtomicLong()
+    private val fastTooBig = AtomicLong()
+    private val fastTranscodedSent = AtomicLong()
+    private val transcodeFallbacks = AtomicLong()
+    private val fastDrops: Map<FastPathDrop, AtomicLong> = FastPathDrop.entries.associateWith { AtomicLong() }
+    private val bleSideOffered = AtomicLong()
+    private val bleSidePartsAired = AtomicLong()
+    private val bleSideTooBig = AtomicLong()
+    private val bleSideHeard = AtomicLong()
+    private val bleSideReassembled = AtomicLong()
+    private val bleSideDeduped = AtomicLong()
+    private val bleSideDrops: Map<BleSideDrop, AtomicLong> = BleSideDrop.entries.associateWith { AtomicLong() }
+    private val bleLinkDupSkipped = AtomicLong()
+    private val bleCodedSightings = AtomicLong()
+    private val bleCodedDials = AtomicLong()
+    private val blePhyStepsDown = AtomicLong()
+    private val blePhyStepsUp = AtomicLong()
+    private val blePhyGiveUps = AtomicLong()
+    private val bleCodedAdvertDark = AtomicLong()
+    private val digestsReplaced = AtomicLong()
+    private val spoolTablesDerived = AtomicLong()
+    private val spoolPushed = AtomicLong()
+    private val spoolPulled = AtomicLong()
+    private val spoolBridged = AtomicLong()
+    private val spoolInvalid = AtomicLong()
+    private val spoolAccounted = AtomicLong()
+    private val spoolErrors = AtomicLong()
+    private val spoolAttachPushed = AtomicLong()
+    private val spoolAttachPulled = AtomicLong()
+    private val spoolAttachDeferred = AtomicLong()
+    private val spoolAttachRefused = AtomicLong()
+    private val loraSent = AtomicLong()
+    private val loraFragSent = AtomicLong()
+    private val loraTranscoded = AtomicLong()
+    private val loraPadded = AtomicLong()
+    private val loraReceived = AtomicLong()
+    private val loraReassembled = AtomicLong()
+    private val loraTooBig = AtomicLong()
+    private val loraDroppedQueue = AtomicLong()
+    private val loraAirtimeHeld = AtomicLong()
+    private val loraAirtimeHeldByBucket = ConcurrentHashMap<String, AtomicLong>()
+    private val loraSuppressed = AtomicLong()
+    private val loraNak = AtomicLong()
+    private val loraNakByReason = ConcurrentHashMap<String, AtomicLong>()
+    private val loraSessionUps = AtomicLong()
+    private val loraDmSent = AtomicLong()
+    private val loraDmReceived = AtomicLong()
+    private val loraReoffered = AtomicLong()
+    private val loraProfileRefanSkipped = AtomicLong()
+    private val loraOfferSent = AtomicLong()
+    private val loraOfferReceived = AtomicLong()
+    private val loraBridged = AtomicLong()
+    private val loraBridgeRefused = AtomicLong()
+    private val loraPassive = AtomicLong()
+    private val loraSkippedLinked = AtomicLong()
+    private val loraSkippedInternet = AtomicLong()
+    private val loraUnheardHeld = AtomicLong()
+    private val loraDmProbes = AtomicLong()
+    private val loraStaleAtSend = AtomicLong()
+    private val loraStaleAtSendByReason = ConcurrentHashMap<String, AtomicLong>()
+    private val loraTickDeferred = AtomicLong()
+
+    // The Meshtastic room's inbound half: how much chat the board's primary channel actually carries, how
+    // much of it arrives off an MQTT uplink, and what the filters turn away. Nothing here transmits, so none
+    // of it touches the airtime ledger.
+    private val meshPostHeard = AtomicLong()
+    private val meshPostIngested = AtomicLong()
+    private val meshPostViaMqtt = AtomicLong()
+    private val meshPostMatched = AtomicLong()
+    private val meshPostVerified = AtomicLong()
+    private val meshPostBoardVerified = AtomicLong()
+    private val meshPostSignatureMismatch = AtomicLong()
+    private val meshPostRefusedByReason = ConcurrentHashMap<String, AtomicLong>()
+
+    // The Meshtastic room's outbound half. Unlike the four above these DO spend airtime, so `publicPostSent`
+    // read against the PUBLIC bucket in `…debug.LORA` is what says whether the quota is set right; a
+    // refusal is one the composer showed the user.
+    private val publicPostSent = AtomicLong()
+    private val publicPostRefusedByReason = ConcurrentHashMap<String, AtomicLong>()
+
+    // The DM auto-reply (`mesh/lora/DmAutoReplyPolicy`): `heard` is every text addressed to the board, `sent`
+    // the ones answered — airtime, like `publicPostSent` — and the gap is itemised by refusal, the policy's
+    // caps and the transport's gates in one map.
+    private val autoReplyHeard = AtomicLong()
+    private val autoReplySent = AtomicLong()
+    private val autoReplyRefusedByReason = ConcurrentHashMap<String, AtomicLong>()
+
+    /** A frame this device authored and injected into the mesh. */
+    fun onOriginated() {
+        framesOriginated.incrementAndGet()
+    }
+
+    /** A newly-seen frame delivered to the app layer. */
+    fun onDelivered() {
+        framesDelivered.incrementAndGet()
+    }
+
+    /** A pending relay that fired (we forwarded the frame onward). */
+    fun onRelayed() {
+        framesRelayed.incrementAndGet()
+    }
+
+    /**
+     * A point-to-point frame handed its last hop to an addressee we hold a live link to (`MeshRouter.handOn`) —
+     * the flood's counterpart for a frame the flood never carries, and in practice a far pocket's ✓✓ reaching a
+     * board-less author behind this phone's board.
+     */
+    fun onHandedOn() {
+        framesHandedOn.incrementAndGet()
+    }
+
+    /** A pending relay we cancelled because a neighbor was overheard relaying the same frame. */
+    fun onSuppressed() {
+        framesSuppressed.incrementAndGet()
+    }
+
+    /** A duplicate of an already-seen frame, dropped without re-delivery. */
+    fun onDeduped() {
+        framesDeduped.incrementAndGet()
+    }
+
+    /** [bytes] put on the wire (counted once per target endpoint a payload is sent to). */
+    fun onBytesSent(bytes: Long) {
+        bytesSent.addAndGet(bytes)
+    }
+
+    /** An inbound frame we wanted was dropped for [reason] (not a policy drop — see [DropReason]). */
+    fun onDropped(reason: DropReason) {
+        drops.getValue(reason).incrementAndGet()
+    }
+
+    /** A contact-card intro we originated to a pending peer (see [IntroSync]) — a sealed `CTL_PROFILE` DM. */
+    fun onIntroSent() {
+        introsSent.incrementAndGet()
+    }
+
+    /** A sealed frame we sent to confirm a still-unconfirmed peer's session (the intro driver's answer). */
+    fun onIntroAnswered() {
+        introsAnswered.incrementAndGet()
+    }
+
+    /** A key-request frame we sent to recover a peer's missing profile/key (see [KeyExchange]). */
+    fun onKeyRequested() {
+        keyRequestsSent.incrementAndGet()
+    }
+
+    /** A cached peer profile we re-served in answer to another node's key request. */
+    fun onKeyServed() {
+        keysServed.incrementAndGet()
+    }
+
+    /** A previously-missing peer key we recovered (a frame that was dropping NO_SENDER_KEY can now verify). */
+    fun onKeyRecovered() {
+        keysRecovered.incrementAndGet()
+    }
+
+    /** A frame dropped for a missing sender key that we parked to replay once the key arrives (see [PendingInbound]). */
+    fun onFrameHeld() {
+        framesHeld.incrementAndGet()
+    }
+
+    /** A parked frame we replayed through the deliver path after its sender's key was pinned. */
+    fun onFrameReplayed() {
+        framesReplayed.incrementAndGet()
+    }
+
+    /**
+     * The heartbeat basket ([app.getknit.knit.mesh.MeshManager.heal]) ran to its end: the sweeps, the retries,
+     * the profile republish and the sealed profile updates. `heal()` itself returns the moment the basket is
+     * launched, so this is the one signal that it finished — what the mesh-in-a-box lab waits on before it
+     * re-links a node, because a profile the basket republishes is seeded into custody, never flooded, and a
+     * link-up whose digest exchange runs before that row exists serves it only on the 60 s re-offer.
+     */
+    fun onHealCompleted() {
+        healsCompleted.incrementAndGet()
+    }
+
+    /**
+     * A neighbor's `blobreq` has been answered to its end — served, refused as already in flight, or turned
+     * into a want of our own. Frames are handled one at a time, so an ask can sit behind a slow frame for a
+     * while; this is what the mesh-in-a-box lab waits on before it lands bytes the ask would otherwise find.
+     */
+    fun onBlobAskHandled() {
+        blobAsksHandled.incrementAndGet()
+    }
+
+    /**
+     * A carrier left a carried DM's picture to its linked recipient instead of pulling it now (ADR 2026-10.g24x) — what
+     * the mesh-in-a-box lab waits on, since custody holds the frame before the pull is decided.
+     */
+    fun onCarrierPullDeferred() {
+        carrierPullsDeferred.incrementAndGet()
+    }
+
+    /** We streamed a neighbor only the rest of a blob, from the offset its ask named: a cut transfer resumed (#116). */
+    fun onFileResumedOut() {
+        filesResumedOut.incrementAndGet()
+    }
+
+    /** A link took the rest of a blob onto the prefix we kept from a cut transfer, instead of the whole file (#116). */
+    fun onFileResumedIn() {
+        filesResumedIn.incrementAndGet()
+    }
+
+    /**
+     * A file spliced from a kept prefix and a holder's tail failed its hash check, so the prefix was dropped and the
+     * blob asked for from byte 0 (#116). Anything but zero is a holder or a prefix that was wrong.
+     */
+    fun onSpliceRefused() {
+        splicesRefused.incrementAndGet()
+    }
+
+    /**
+     * What the blob fetch did (ADR 2026-10.6e5t): a holder query sent, answered, or refused over budget; an answer
+     * taken (what the mesh-in-a-box lab waits on before it moves the clock) or ignored; an ask of a holder that said it
+     * holds the blob, a confirm query, a fallback to the next holder, a blind ask of a neighbour that cannot be queried,
+     * and a pull-through ask.
+     */
+    fun onBlobEvent(event: BlobExchange.BlobEvent) {
+        blobEvents.getValue(event).incrementAndGet()
+    }
+
+    /** A broadcast/group delivery receipt we re-sent to its author because the first best-effort tick may not
+     *  have landed (delay-tolerant recovery, see [AckSync]) — a rising count means ticks are being recovered. */
+    fun onReceiptResent() {
+        receiptsResent.incrementAndGet()
+    }
+
+    /** An outbound DM sealed under the v2 epoch ratchet (forward-secret). */
+    fun onDmSealedV2() {
+        dmSealedV2.incrementAndGet()
+    }
+
+    /** An outbound DM-form frame sealed under crypto scheme v3 (derived nonce, compact plaintext — ADR 059). */
+    fun onDmSealedV3() {
+        dmSealedV3.incrementAndGet()
+    }
+
+    /** A live-link delivery tick sent unsigned (v3, `relay = false`) — the one-packet form on every fast plane. */
+    fun onTickUnsigned() {
+        ticksUnsigned.incrementAndGet()
+    }
+
+    /** A v2-eligible DM that fell back to the v1 static wrap (peer downgraded / no epoch base) — should
+     *  trend to zero as the installed base upgrades; a persistent count is the signal to investigate. */
+    fun onDmSealedV1Fallback() {
+        dmSealedV1Fallback.incrementAndGet()
+    }
+
+    /** A delivery receipt sealed as a v2 ctl DM (no vaccine-purge — the sealed-era custody contract). */
+    fun onReceiptSealed() {
+        receiptsSealed.incrementAndGet()
+    }
+
+    /** A seal-eligible receipt whose sealDm failed (no session + no usable prekey) — sent cleartext instead. */
+    fun onReceiptSealedFallback() {
+        receiptsSealedFallback.incrementAndGet()
+    }
+
+    /** A batched group tick originated into custody (one frame, however many acks it carries). */
+    fun onReceiptCustodied() {
+        receiptsCustodied.incrementAndGet()
+    }
+
+    /**
+     * DM receipts that rode together instead of alone (ADR 054): `ids − 1` per coalesced tick, plus every ack
+     * a reply carried inline. The field oracle for the LoRa airtime saving — each one is a ~3 s frame not sent.
+     */
+    fun onReceiptCoalesced(count: Int) {
+        receiptsCoalesced.addAndGet(count.toLong())
+    }
+
+    /**
+     * Broadcast-room delivery ticks that rode a frame already going to their author instead of waiting for a
+     * link (ADR 2026-09.aa27). Each one is a room tick that reached its author for no frame and no custody
+     * row of its own; the gap between this and the ticks still held is what the ride does not cover.
+     */
+    fun onReceiptRidden(count: Int) {
+        receiptsRidden.addAndGet(count.toLong())
+    }
+
+    /**
+     * A room tick batch that waited out its ride hold and was pushed straight into its author's spool scope
+     * (ADR 2026-09.y5f3): sealed once, no frame on the radios, no custody row here. Beside [onReceiptRidden]
+     * and `receiptsResent`, this is the third way a room ✓✓ leaves a phone with no link to its author.
+     */
+    fun onReceiptSpooled() {
+        receiptsSpooled.incrementAndGet()
+    }
+
+    /** A reaction sealed as a v2 ctl frame (DM or group form). */
+    fun onReactionSealed() {
+        reactionsSealed.incrementAndGet()
+    }
+
+    /** A DM/group-target reaction that went out as the legacy cleartext frame (incapable peer/group or a
+     *  failed seal) — the "still walking naked in a private context" residual; broadcast never counts. */
+    fun onReactionSealedFallback() {
+        reactionsSealedFallback.incrementAndGet()
+    }
+
+    /** One outbound group message sealed under the sender-key chain (v2, group form). */
+    fun onGroupSealedRatchet() {
+        groupSealedRatchet.incrementAndGet()
+    }
+
+    /** A ratchet-eligible group message that fell back to the v1 per-member wrap (seal returned null). */
+    fun onGroupSealedV1Fallback() {
+        groupSealedV1Fallback.incrementAndGet()
+    }
+
+    /** One epoch-seed ctl DM originated toward a member (distributions + re-sends). */
+    fun onGroupSeedSent() {
+        groupSeedsSent.incrementAndGet()
+    }
+
+    /** One fresh recv chain adopted from a member's seed distribution. */
+    fun onGroupSeedAdopted() {
+        groupSeedsAdopted.incrementAndGet()
+    }
+
+    /**
+     * One `CTL_GROUP_KEY` parked because it named a group we did not hold yet ([PendingGroupKeys]) — the
+     * seed that outran its group's first frame and carried no roster of its own (an older build's), or one
+     * whose roster was refused. Paired with [onGroupSeedReplayed]: a held count that never turns into a
+     * replay is a member that heard a seed and then never saw the roster.
+     */
+    fun onGroupSeedHeld() {
+        groupSeedsHeld.incrementAndGet()
+    }
+
+    /** One parked `CTL_GROUP_KEY` re-run through the deliver path once its group was reconciled. */
+    fun onGroupSeedReplayed() {
+        groupSeedsReplayed.incrementAndGet()
+    }
+
+    /**
+     * One `CTL_GROUP_KEY_REQ` originated — we asked a member to re-seal the seeds we are missing. The
+     * request leg of the recovery ADR 017 describes, and the only one that used to be unmetered: with
+     * `groupSeedsSent`/`groupSeedsAdopted` covering the answer and the adoption, a node stuck on
+     * `GROUP_RATCHET_NO_KEY` still could not be told apart from one whose heuristic never fired, except by
+     * a logcat line (unreadable on a lab Pixel that had not restarted — three-Pixel capture, 2026-09-07).
+     */
+    fun onGroupKeyRequested() {
+        groupKeyRequestsSent.incrementAndGet()
+    }
+
+    /** We minted a group's shared spool root — version 1, or a departure re-mint (SPOOL_PROTOCOL §3.2). */
+    fun onGroupRootMinted() {
+        groupRootsMinted.incrementAndGet()
+    }
+
+    /**
+     * A strictly-newer gossiped root replaced ours. Read together with [onGroupRootMinted]: a steady
+     * trickle of adoptions with no local mint is healthy gossip; repeated mint/adopt alternation on one
+     * device is a lineage that is not collapsing.
+     */
+    fun onGroupRootAdopted() {
+        groupRootsAdopted.incrementAndGet()
+    }
+
+    /** A Bluetooth L2CAP connect attempt to a peer failed for [reason] (see [ConnectFailReason]). */
+    fun onBtConnectFailed(reason: ConnectFailReason) {
+        connectFails.getValue(reason).incrementAndGet()
+    }
+
+    /** A Bluetooth L2CAP link came up — context for the connect-failure counts (success vs failure rate). */
+    fun onBtLinkEstablished() {
+        btLinksEstablished.incrementAndGet()
+    }
+
+    /** Record the current count of concurrent inbound NAN serves; keeps the session peak (P1 observability). */
+    fun onNanServes(concurrent: Long) {
+        nanServesPeak.accumulateAndGet(concurrent) { a, b -> maxOf(a, b) }
+    }
+
+    /**
+     * High-water mark of the **owed-with-no-link episode** — how long a sync has stayed owed to a reachable
+     * peer while no data path formed (`WifiAwareTransport.syncOwedSince`, the clock the wedge watchdog runs
+     * on). Zero on a healthy mesh: an idle converged mesh owes nothing, and a normal sync clears the episode
+     * the moment a link forms.
+     *
+     * This exists because the coordination plane can mask a dead data path. Once sealed DM-form chat rides
+     * `fastSend` ([shouldFastSend]), a node whose NDP never forms still delivers messages — it just stops
+     * converging custody, quietly. Before that, a wedge announced itself by breaking DMs (three-Pixel
+     * capture, 2026-09-07); after it, this gauge is what is left to notice one. A few seconds is ordinary
+     * handshake latency; minutes means the data plane is not forming and only the best-effort planes are
+     * carrying anything.
+     */
+    fun onNanSyncOwed(owedForMs: Long) {
+        nanOwedNoLinkPeakMs.accumulateAndGet(owedForMs) { a, b -> maxOf(a, b) }
+    }
+
+    /** An inbound NAN accept was refused by the serve policy (cap reached / initiator handshake in flight). */
+    fun onNanAcceptRefused() {
+        nanAcceptsRefused.incrementAndGet()
+    }
+
+    /** A live publish session's updatePublish failed — the ICM relight fell back to the subscribe re-arm. */
+    fun onNanIcmKeepaliveFailed() {
+        nanIcmKeepaliveFailed.incrementAndGet()
+    }
+
+    /**
+     * A publish/subscribe was refused for the foreground-only location app-op with Knit off screen (API 29-32,
+     * ADR 2026-09.535d) — once per latch, not per attempt. Non-zero after the app has been opened once means the
+     * service's `location` foreground type is not taking on this device.
+     */
+    fun onNanOffScreenRefused() {
+        nanOffScreenRefusals.incrementAndGet()
+    }
+
+    /** A coordination-plane message (cue/fast-frame) was MAC-acked by its peer. */
+    fun onNanMsgAcked() {
+        nanMsgsAcked.incrementAndGet()
+    }
+
+    /** A coordination-plane message got no ACK (peer dozing/out of range, or the tx queue overflowed). */
+    fun onNanMsgSendFailed() {
+        nanMsgSendsFailed.incrementAndGet()
+    }
+
+    /**
+     * The coordination-plane watchdog (ADR 2026-09.jjhg) holds a stalled episode open: no ack since it began, sends
+     * swallowed or failing while peers are still sighted. Peak length, like [onNanSyncOwed]'s — a plane that never
+     * stalls reads 0, and one the cycle cured reads how long it took.
+     */
+    fun onNanMsgPlaneStalled(stalledForMs: Long) {
+        nanMsgPlaneStalledPeakMs.accumulateAndGet(stalledForMs) { a, b -> maxOf(a, b) }
+    }
+
+    /** The coordination-plane watchdog cycled the Aware session (a NAN restart) to cure a stalled plane. */
+    fun onNanMsgPlaneCycled() {
+        nanMsgPlaneCycles.incrementAndGet()
+    }
+
+    /** A fast frame left in the compact (`0x03`, single-message) encoding toward one target. */
+    fun onFastCompactSent() {
+        fastCompactSent.incrementAndGet()
+    }
+
+    /** A fast frame left in the legacy (`0x01`) encoding toward one target (peer lacks the cap bit). */
+    fun onFastLegacySent() {
+        fastLegacySent.incrementAndGet()
+    }
+
+    /** A fast frame left fragmented (`0x04`) toward one target — dwarfed by [onFastCompactSent] is healthy. */
+    fun onFastFragSent() {
+        fastFragSent.incrementAndGet()
+    }
+
+    /** A fragmented fast frame reassembled completely on receive. */
+    fun onFastReassembled() {
+        fastReassembled.incrementAndGet()
+    }
+
+    /** A target was skipped because no encoding fit the message cap — the frame rides flood/custody only. */
+    fun onFastTooBig() {
+        fastTooBig.incrementAndGet()
+    }
+
+    /** A fast frame left in the transcoded (`0x05`, ADR 060) encoding toward one target, fragmented or not. */
+    fun onFastTranscodedSent() {
+        fastTranscodedSent.incrementAndGet()
+    }
+
+    /**
+     * A frame asked for the transcoded form could not be reproduced by the transcoder and rode `0x03` instead
+     * (any plane). Should be ~0: with volume, some build emits an encoding `FrameTranscoder` does not model.
+     */
+    fun onTranscodeFallback() {
+        transcodeFallbacks.incrementAndGet()
+    }
+
+    /** An inbound fast-path message was discarded — see [FastPathDrop] for how to read each reason. */
+    fun onFastDropped(reason: FastPathDrop) {
+        fastDrops.getValue(reason).incrementAndGet()
+    }
+
+    /** A fast frame was accepted onto the BLE side channel's queue (`BleSideChannel.offer`). */
+    fun onBleSideOffered() {
+        bleSideOffered.incrementAndGet()
+    }
+
+    /** A page (one frame, or one fragment of one) went on air on a side-channel advertising set. */
+    fun onBleSidePartAired() {
+        bleSidePartsAired.incrementAndGet()
+    }
+
+    /** A frame offered to the side channel fit no page even fragmented — it rides the links and the flood only. */
+    fun onBleSideTooBig() {
+        bleSideTooBig.incrementAndGet()
+    }
+
+    /** A frame was heard off a side-channel page and handed to the router (after the channel's own dedup). */
+    fun onBleSideHeard() {
+        bleSideHeard.incrementAndGet()
+    }
+
+    /** A multi-part side-channel frame reassembled completely. */
+    fun onBleSideReassembled() {
+        bleSideReassembled.incrementAndGet()
+    }
+
+    /** A page or frame the channel had already heard inside its window (the same part airs for its whole dwell). */
+    fun onBleSideDeduped() {
+        bleSideDeduped.incrementAndGet()
+    }
+
+    /**
+     * A frame already on its way over a Bluetooth link (or just in off it) was handed to that link again and
+     * skipped — the router's flood copy after the fast path's, or a re-fan back toward its hop (`LinkCrossings`).
+     * Climbs about one per room frame per link on a two-radio mesh; the far end's SeenSet used to eat these.
+     */
+    fun onBleLinkDupSkipped() {
+        bleLinkDupSkipped.incrementAndGet()
+    }
+
+    /** A presence advert was heard on the Coded PHY (the experiment, ADR 2026-10.yvn6) — one per scan callback. */
+    fun onBleCodedSighting() {
+        bleCodedSightings.incrementAndGet()
+    }
+
+    /** A dial went to a peer's Coded address: no fresh 1M advert of it was heard, so the link opens on Coded. */
+    fun onBleCodedDial() {
+        bleCodedDials.incrementAndGet()
+    }
+
+    /** A link's PHY changed under the experiment: down to Coded ([toCoded]) or back up to 1M/2M. */
+    fun onBlePhyStep(toCoded: Boolean) {
+        (if (toCoded) blePhyStepsDown else blePhyStepsUp).incrementAndGet()
+    }
+
+    /** A link's PHY request went unanswered or was answered with another PHY: that link is left where it is. */
+    fun onBlePhyGiveUp() {
+        blePhyGiveUps.incrementAndGet()
+    }
+
+    /** The controller refused the Coded advert set (too many sets, or no feature): dark until the next bring-up. */
+    fun onBleCodedAdvertDark() {
+        bleCodedAdvertDark.incrementAndGet()
+    }
+
+    /**
+     * A custody digest was handed to a link while an older one still waited there unwritten, and took its id
+     * set instead of queueing behind it (`FramedLink.sendDigest`, ADR 2026-09.tjfb). Zero on an idle link;
+     * about one a minute per link while a back-fill or a file holds the writer.
+     */
+    fun onDigestReplaced() {
+        digestsReplaced.incrementAndGet()
+    }
+
+    /** The side channel discarded a frame — see [BleSideDrop] for how to read each reason. */
+    fun onBleSideDropped(reason: BleSideDrop) {
+        bleSideDrops.getValue(reason).incrementAndGet()
+    }
+
+    /**
+     * A file (avatar/attachment) was accepted onto a live link on [transport]'s plane — the per-radio split
+     * that shows whether large blobs are riding the NAN fast path or falling back to BLE.
+     */
+    fun onFileSent(transport: TransportKind) {
+        when (transport) {
+            TransportKind.WifiAware -> filesSentNan.incrementAndGet()
+
+            TransportKind.Bluetooth -> filesSentBt.incrementAndGet()
+
+            TransportKind.LoRa -> Unit
+
+            // the LoRa plane carries no files
+            TransportKind.Other -> Unit
+        }
+    }
+
+    /** An armed bulk-transfer NDP didn't come up within the composite's grace — the blob fell back to BLE.
+     *  Climbing far faster than [Snapshot.Files.filesSentNan] means we're arming ghosts (see BulkWantTracker). */
+    fun onBulkGraceTimeout() {
+        nanBulkGraceTimeouts.incrementAndGet()
+    }
+
+    /**
+     * The spool plane re-derived its scope table (ADR 2026-09.dcah): once per input event — a session
+     * confirmed, a pair peer named or pinned, a root minted or adopted, a room joined — and once a minute as
+     * the net. The device oracle for the event hooks: a burst of events is a few, an idle hour is sixty.
+     */
+    fun onSpoolTableDerived() {
+        spoolTablesDerived.incrementAndGet()
+    }
+
+    /** A sealed custody frame was accepted by a spool (the Internet plane's outbound work). */
+    fun onSpoolPushed() {
+        spoolPushed.incrementAndGet()
+    }
+
+    /** A blob pulled or evented from a spool passed the §4.4 unseal/validate pipeline. */
+    fun onSpoolPulled() {
+        spoolPulled.incrementAndGet()
+    }
+
+    /** A validated spool blob re-entered mesh delivery — the island bridge actually firing. */
+    fun onSpoolBridged() {
+        spoolBridged.incrementAndGet()
+    }
+
+    /** A blob failed hash/AEAD/signature/frame-set and was quarantined (spec §9.3). Should stay at 0. */
+    fun onSpoolInvalid() {
+        spoolInvalid.incrementAndGet()
+    }
+
+    /**
+     * A bridged blob that local custody did not keep entered the accounted set (spec §9.6) — it is folded
+     * into our digest as held and never pulled again. Climbing slowly is normal: it is the 24–48 h band
+     * between the mesh custody TTL and the scope TTL. Climbing in step with [onSpoolPulled] round after
+     * round is the ADR 062 regression — the band being re-pulled instead of accounted.
+     */
+    fun onSpoolAccounted() {
+        spoolAccounted.incrementAndGet()
+    }
+
+    /** A spool answered `err`, or refused a scope at SUB. */
+    fun onSpoolError() {
+        spoolErrors.incrementAndGet()
+    }
+
+    /** One sealed attachment chunk was accepted by a spool (spec §9.5's push half). */
+    fun onSpoolAttachmentPushed() {
+        spoolAttachPushed.incrementAndGet()
+    }
+
+    /** A whole attachment was reassembled from a spool and verified against the hash its frame named. */
+    fun onSpoolAttachmentPulled() {
+        spoolAttachPulled.incrementAndGet()
+    }
+
+    /**
+     * An attachment we hold was held back from a spool this round because the radios are still carrying
+     * it (`AttachmentDeferPolicy`). Counted because a deferral and a broken upload are otherwise
+     * indistinguishable in the field — a silent gate reads exactly like a bug.
+     */
+    fun onSpoolAttachmentDeferred() {
+        spoolAttachDeferred.incrementAndGet()
+    }
+
+    /**
+     * A spool attachment this device's own screening refused (bytes dropped, verdict kept) was not fetched
+     * again (#109). Counted for the same reason as a deferral: a skip and a stuck fetch look alike otherwise.
+     */
+    fun onSpoolAttachmentRefused() {
+        spoolAttachRefused.incrementAndGet()
+    }
+
+    /** One frame sent over the LoRa plane (a whole frame, however many fragments it split into). */
+    fun onLoraSent() {
+        loraSent.incrementAndGet()
+    }
+
+    /** A LoRa frame that had to be split across fragments (dwarfed by [onLoraSent] is healthy). */
+    fun onLoraFragSent() {
+        loraFragSent.incrementAndGet()
+    }
+
+    /** A LoRa frame encoded in the transcoded (`0x05`, ADR 060) form — the one-packet form for a signed tick. */
+    fun onLoraTranscoded() {
+        loraTranscoded.incrementAndGet()
+    }
+
+    /**
+     * A LoRa frame whose last packet was padded past the firmware's signature cliff (ADR 2026-09.mhs5), trading a
+     * 66-byte signature the board would have added for a few bytes of pad. Counted because the saving is
+     * otherwise invisible: a padded frame and an unpadded one look the same everywhere but the air.
+     */
+    fun onLoraPadded() {
+        loraPadded.incrementAndGet()
+    }
+
+    /** A frame received over the LoRa plane (after reassembly + decode). */
+    fun onLoraReceived() {
+        loraReceived.incrementAndGet()
+    }
+
+    /** A fragmented LoRa frame reassembled completely on receive. */
+    fun onLoraReassembled() {
+        loraReassembled.incrementAndGet()
+    }
+
+    /** A frame no LoRa encoding could carry (> ~687 B compact); it rides the radios/custody instead. */
+    fun onLoraTooBig() {
+        loraTooBig.incrementAndGet()
+    }
+
+    /** A LoRa frame shed because the outbound pace queue was full (oldest whole frame of the lowest class, or the newcomer). */
+    fun onLoraDroppedQueue() {
+        loraDroppedQueue.incrementAndGet()
+    }
+
+    /** A LoRa fan-out suppressed: already sent/received over LoRa within the dedup window, or a stale custody re-serve. */
+    fun onLoraSuppressed() {
+        loraSuppressed.incrementAndGet()
+    }
+
+    /**
+     * A routing NAK from the board, by its `Routing.error_reason` name (rate/duty-cycle/no-channel/too-large…);
+     * a rising count means airtime pressure — or, per reason, something structural (a `TOO_LARGE` says the
+     * payload cap is wrong, a `NO_CHANNEL` that the bound slot is gone). The total was all the field ever
+     * saw until a lab session logged ten NAKs nobody could attribute (2026-08-29).
+     */
+    fun onLoraNak(reason: String = "UNKNOWN") {
+        loraNak.incrementAndGet()
+        loraNakByReason.getOrPut(reason) { AtomicLong() }.incrementAndGet()
+    }
+
+    /**
+     * A queued LoRa frame the airtime budget made wait, by the [AirBucket] name it spends from. **Held, not
+     * dropped** — it stays queued for a later window — which is exactly why it needed a counter of its own:
+     * `loraDroppedQueue` only ever sees such a frame if the queue later fills and sheds it, so a plane whose
+     * bucket is spent reads perfectly healthy right up until it overflows (field-observed 2026-09-04, a 99 %
+     * BRIDGE bucket with `loraBridgeRefused` at zero throughout).
+     *
+     * Counted once per frame, not once per pacer wake, so this measures congestion rather than the clock.
+     */
+    fun onLoraAirtimeHeld(bucket: String) {
+        loraAirtimeHeld.incrementAndGet()
+        loraAirtimeHeldByBucket.getOrPut(bucket) { AtomicLong() }.incrementAndGet()
+    }
+
+    /** The LoRa board session reached Ready — context for the received/sent counts (how often it links). */
+    fun onLoraSessionUp() {
+        loraSessionUps.incrementAndGet()
+    }
+
+    /**
+     * A **DM-form** frame sent over LoRa (ADR 039) — a sealed chat addressed to one peer. The transport cannot
+     * read it, so this counts real DMs and their sealed receipts/reactions/ctl frames alike.
+     */
+    fun onLoraDmSent() {
+        loraDmSent.incrementAndGet()
+    }
+
+    /** A DM-form frame received over LoRa — same opacity caveat as [onLoraDmSent]. */
+    fun onLoraDmReceived() {
+        loraDmReceived.incrementAndGet()
+    }
+
+    /** A carried DM-form frame re-offered over LoRa to a peer just heard for the first time (ADR 039). */
+    fun onLoraReoffered() {
+        loraReoffered.incrementAndGet()
+    }
+
+    /**
+     * A relayed `profile` the fan-out declined to put on the air again: the same publish already rode this
+     * plane inside the re-fan window (ADR 057). Against [loraSent] this is the measure of the redundancy
+     * that made profiles 79 % of one lab gateway's LoRa traffic.
+     */
+    fun onLoraProfileRefanSkipped() {
+        loraProfileRefanSkipped.incrementAndGet()
+    }
+
+    /**
+     * A gossip OFFER that **reached the air** — one packet naming the custody window this gateway holds
+     * (ADR 044). Counted at transmit and not at enqueue, because an offer that never flies is the one failure
+     * this counter has to be able to show: it read 7 against two transmissions in the field while the far
+     * pocket heard none at all. It is also what makes `loraSent − loraDmSent − loraOfferSent` the profile +
+     * room count the debug bridge documents.
+     */
+    fun onLoraOfferSent() {
+        loraOfferSent.incrementAndGet()
+    }
+
+    /** A gossip OFFER heard from another gateway, co-pocket or far. */
+    fun onLoraOfferReceived() {
+        loraOfferReceived.incrementAndGet()
+    }
+
+    /** Frames served across the bridge because a far gateway's OFFER showed it lacked them. */
+    fun onLoraBridged(count: Int) {
+        loraBridged.addAndGet(count.toLong())
+    }
+
+    /** A backfill request refused outright — the publisher had already spent its hourly serve allowance. */
+    fun onLoraBridgeRefused() {
+        loraBridgeRefused.incrementAndGet()
+    }
+
+    /**
+     * A transmission suppressed because another board in this pocket is the gateway. Healthy and expected on
+     * a spare board; climbing on a phone that should be bridging means the election picked someone else.
+     */
+    fun onLoraPassive() {
+        loraPassive.incrementAndGet()
+    }
+
+    /**
+     * A DM-form frame kept off LoRa because its recipient is us or a peer a higher-preference plane holds a
+     * live link to (ADR 054) — the link carries it. Climbing while texting a pocket-mate is the gate working;
+     * climbing while a far peer starves means the link set is wrong.
+     */
+    fun onLoraSkippedLinked() {
+        loraSkippedLinked.incrementAndGet()
+    }
+
+    /**
+     * A DM-form frame kept off LoRa because its recipient was seen on a connected spool within
+     * `SPOOL_COVER_MS` (ADR 2026-09.y5f3) — the spool carries it, for free. Split from [onLoraSkippedLinked]
+     * on purpose: climbing here while the phones are far apart is airtime saved, climbing there is a link.
+     */
+    fun onLoraSkippedInternet() {
+        loraSkippedInternet.incrementAndGet()
+    }
+
+    /**
+     * A DM-form frame kept off LoRa because its recipient has not been heard on this plane within the linger
+     * and its probe window was already spent (ADR 2026-10.a4pm) — it stays in custody, and the recipient's
+     * first hearing re-offers it. Climbing while a far peer is switched off is airtime saved; climbing while
+     * that peer is in range and talking means `reachable` is not being fed.
+     */
+    fun onLoraUnheardHeld() {
+        loraUnheardHeld.incrementAndGet()
+    }
+
+    /**
+     * A DM put on the air to a recipient this plane has not heard, as the one probe of its window
+     * (ADR 2026-10.a4pm): if the recipient is there, its ✓✓ makes it heard and the DMs held behind the probe
+     * follow through the re-offer. At most one per recipient per window; against [onLoraUnheardHeld] it
+     * says how much the gate kept back.
+     */
+    fun onLoraDmProbe() {
+        loraDmProbes.incrementAndGet()
+    }
+
+    /**
+     * A queued frame was refused at the moment it reached the air, because an enqueue-time gate had since
+     * changed its answer (`StaleAtSend`: the addressee linked on a better plane, the frame aged past the
+     * freshness window, or we stood down to a co-pocket gateway).
+     *
+     * Deliberately not folded into [onLoraSkippedLinked] or [onLoraSuppressed]: those say the gate refused a
+     * frame before it ever queued, this says the queue held it until the answer moved, and only the split
+     * measures the race. Climbing under `LINKED` while the phones are in Wi-Fi Aware range is airtime saved;
+     * climbing while they are far apart means the link set is lying.
+     */
+    fun onLoraStaleAtSend(reason: String) {
+        loraStaleAtSend.incrementAndGet()
+        loraStaleAtSendByReason.getOrPut(reason) { AtomicLong() }.incrementAndGet()
+    }
+
+    /** A DM arrived over the board and its ✓✓ was held for the coalescer instead of sealed at once (ADR 054). */
+    fun onLoraTickDeferred() {
+        loraTickDeferred.incrementAndGet()
+    }
+
+    /** A chat packet on the board's public primary — every post in earshot, before any filter runs. */
+    fun onMeshPostHeard() {
+        meshPostHeard.incrementAndGet()
+    }
+
+    /** A post accepted into the Meshtastic room; [viaMqtt] counts the ones off somebody's uplink. */
+    fun onMeshPostIngested(viaMqtt: Boolean) {
+        meshPostIngested.incrementAndGet()
+        if (viaMqtt) meshPostViaMqtt.incrementAndGet()
+    }
+
+    /** A heard post whose speaker's board a contact's profile claims — attributed to that contact at ingest. */
+    fun onMeshPostMatched() {
+        meshPostMatched.incrementAndGet()
+    }
+
+    /** A heard post whose signature verified on this phone under the key the matched contact's profile advertises. */
+    fun onMeshPostVerified() {
+        meshPostVerified.incrementAndGet()
+    }
+
+    /** A heard post our own board vouched for (`xeddsa_signed`), with no contact key on this phone to check it against. */
+    fun onMeshPostBoardVerified() {
+        meshPostBoardVerified.incrementAndGet()
+    }
+
+    /** A signed post on a contact's number that failed under their advertised key — shown as a stranger, never as them. */
+    fun onMeshPostSignatureMismatch() {
+        meshPostSignatureMismatch.incrementAndGet()
+    }
+
+    /** A primary-channel packet the filters turned away, by `PublicChannelPolicy.Refusal`. */
+    fun onMeshPostRefused(reason: String) {
+        meshPostRefusedByReason.computeIfAbsent(reason) { AtomicLong() }.incrementAndGet()
+    }
+
+    /** One post this phone put on its board's primary channel. The only counter here that cost airtime. */
+    fun onPublicPostSent() {
+        publicPostSent.incrementAndGet()
+    }
+
+    /** A post this device did not put on the air, by `PublicPostRefusal`. */
+    fun onPublicPostRefused(reason: String) {
+        publicPostRefusedByReason.computeIfAbsent(reason) { AtomicLong() }.incrementAndGet()
+    }
+
+    /** A text addressed to the board itself — a Meshtastic user's DM — before any gate runs. */
+    fun onAutoReplyHeard() {
+        autoReplyHeard.incrementAndGet()
+    }
+
+    /** One auto-reply the board put on the air. Costs airtime, out of the same PUBLIC share as a post. */
+    fun onAutoReplySent() {
+        autoReplySent.incrementAndGet()
+    }
+
+    /** A DM not answered, by `DmAutoReplyPolicy.Refusal` or `AutoReplyRefusal`. */
+    fun onAutoReplyRefused(reason: String) {
+        autoReplyRefusedByReason.computeIfAbsent(reason) { AtomicLong() }.incrementAndGet()
+    }
+
+    /** Every counter, read at once ([Snapshot]). One group's counters alone come from [frames], [lora] and the rest. */
+    fun snapshot(): Snapshot =
+        Snapshot(
+            frames = frames(),
+            keys = keys(),
+            seals = seals(),
+            receipts = receipts(),
+            groups = groups(),
+            files = files(),
+            bluetooth = bluetooth(),
+            nan = nan(),
+            fast = fast(),
+            spool = spool(),
+            lora = lora(),
+            meshtastic = meshtastic(),
+        )
+
+    /** The [Snapshot.Frames] counters alone, read now. */
+    fun frames(): Snapshot.Frames {
+        val byReason = drops.mapValues { it.value.get() }
+        return Snapshot.Frames(
+            framesOriginated = framesOriginated.get(),
+            framesDelivered = framesDelivered.get(),
+            framesRelayed = framesRelayed.get(),
+            framesHandedOn = framesHandedOn.get(),
+            framesSuppressed = framesSuppressed.get(),
+            framesDeduped = framesDeduped.get(),
+            bytesSent = bytesSent.get(),
+            framesDropped = byReason.values.sum(),
+            dropsByReason = byReason.filterValues { it > 0 },
+            digestsReplaced = digestsReplaced.get(),
+            healsCompleted = healsCompleted.get(),
+        )
+    }
+
+    /** The [Snapshot.Keys] counters alone, read now. */
+    fun keys(): Snapshot.Keys =
+        Snapshot.Keys(
+            keyRequestsSent = keyRequestsSent.get(),
+            keysServed = keysServed.get(),
+            keysRecovered = keysRecovered.get(),
+            framesHeld = framesHeld.get(),
+            framesReplayed = framesReplayed.get(),
+            introsSent = introsSent.get(),
+            introsAnswered = introsAnswered.get(),
+        )
+
+    /** The [Snapshot.Seals] counters alone, read now. */
+    fun seals(): Snapshot.Seals =
+        Snapshot.Seals(
+            dmSealedV2 = dmSealedV2.get(),
+            dmSealedV3 = dmSealedV3.get(),
+            dmSealedV1Fallback = dmSealedV1Fallback.get(),
+            reactionsSealed = reactionsSealed.get(),
+            reactionsSealedFallback = reactionsSealedFallback.get(),
+        )
+
+    /** The [Snapshot.Receipts] counters alone, read now. */
+    fun receipts(): Snapshot.Receipts =
+        Snapshot.Receipts(
+            receiptsResent = receiptsResent.get(),
+            receiptsSealed = receiptsSealed.get(),
+            receiptsSealedFallback = receiptsSealedFallback.get(),
+            receiptsCustodied = receiptsCustodied.get(),
+            receiptsCoalesced = receiptsCoalesced.get(),
+            receiptsRidden = receiptsRidden.get(),
+            receiptsSpooled = receiptsSpooled.get(),
+            ticksUnsigned = ticksUnsigned.get(),
+        )
+
+    /** The [Snapshot.Groups] counters alone, read now. */
+    fun groups(): Snapshot.Groups =
+        Snapshot.Groups(
+            groupSealedRatchet = groupSealedRatchet.get(),
+            groupSealedV1Fallback = groupSealedV1Fallback.get(),
+            groupSeedsSent = groupSeedsSent.get(),
+            groupSeedsAdopted = groupSeedsAdopted.get(),
+            groupSeedsHeld = groupSeedsHeld.get(),
+            groupSeedsReplayed = groupSeedsReplayed.get(),
+            groupKeyRequestsSent = groupKeyRequestsSent.get(),
+            groupRootsMinted = groupRootsMinted.get(),
+            groupRootsAdopted = groupRootsAdopted.get(),
+        )
+
+    /** The [Snapshot.Files] counters alone, read now. */
+    fun files(): Snapshot.Files =
+        Snapshot.Files(
+            filesSentNan = filesSentNan.get(),
+            filesSentBt = filesSentBt.get(),
+            blobAsksHandled = blobAsksHandled.get(),
+            carrierPullsDeferred = carrierPullsDeferred.get(),
+            filesResumedOut = filesResumedOut.get(),
+            filesResumedIn = filesResumedIn.get(),
+            splicesRefused = splicesRefused.get(),
+            blobQueriesSent = blob(BlobExchange.BlobEvent.QuerySent),
+            blobQueriesAnswered = blob(BlobExchange.BlobEvent.QueryAnswered),
+            blobQueriesRefused = blob(BlobExchange.BlobEvent.QueryRefused),
+            blobAnswersTaken = blob(BlobExchange.BlobEvent.AnswerTaken),
+            blobAnswersIgnored = blob(BlobExchange.BlobEvent.AnswerIgnored),
+            blobFetches = blob(BlobExchange.BlobEvent.Fetch),
+            blobConfirms = blob(BlobExchange.BlobEvent.Confirm),
+            blobFallbacks = blob(BlobExchange.BlobEvent.Fallback),
+            blobBlindAsks = blob(BlobExchange.BlobEvent.BlindAsk),
+            blobPullThroughs = blob(BlobExchange.BlobEvent.PullThrough),
+            blobAsksParked = blob(BlobExchange.BlobEvent.Park),
+            blobProgressSent = blob(BlobExchange.BlobEvent.ProgressSent),
+            blobProgressTaken = blob(BlobExchange.BlobEvent.ProgressTaken),
+            blobCancelsSent = blob(BlobExchange.BlobEvent.CancelSent),
+            blobCancelsTaken = blob(BlobExchange.BlobEvent.CancelTaken),
+        )
+
+    private fun blob(event: BlobExchange.BlobEvent): Long = blobEvents.getValue(event).get()
+
+    /** The [Snapshot.Bluetooth] counters alone, read now. */
+    fun bluetooth(): Snapshot.Bluetooth {
+        val connectByReason = connectFails.mapValues { it.value.get() }
+        return Snapshot.Bluetooth(
+            btConnectFails = connectByReason.values.sum(),
+            btConnectFailsByReason = connectByReason.filterValues { it > 0 },
+            btLinksEstablished = btLinksEstablished.get(),
+            bleLinkDupSkipped = bleLinkDupSkipped.get(),
+            bleCodedSightings = bleCodedSightings.get(),
+            bleCodedDials = bleCodedDials.get(),
+            blePhyStepsDown = blePhyStepsDown.get(),
+            blePhyStepsUp = blePhyStepsUp.get(),
+            blePhyGiveUps = blePhyGiveUps.get(),
+            bleCodedAdvertDark = bleCodedAdvertDark.get(),
+            bleSideOffered = bleSideOffered.get(),
+            bleSidePartsAired = bleSidePartsAired.get(),
+            bleSideTooBig = bleSideTooBig.get(),
+            bleSideHeard = bleSideHeard.get(),
+            bleSideReassembled = bleSideReassembled.get(),
+            bleSideDeduped = bleSideDeduped.get(),
+            bleSideDropsByReason = bleSideDrops.mapValues { it.value.get() }.filterValues { it > 0 },
+        )
+    }
+
+    /** The [Snapshot.Nan] counters alone, read now. */
+    fun nan(): Snapshot.Nan =
+        Snapshot.Nan(
+            nanServesPeak = nanServesPeak.get(),
+            nanOwedNoLinkPeakMs = nanOwedNoLinkPeakMs.get(),
+            nanAcceptsRefused = nanAcceptsRefused.get(),
+            nanIcmKeepaliveFailed = nanIcmKeepaliveFailed.get(),
+            nanOffScreenRefusals = nanOffScreenRefusals.get(),
+            nanMsgsAcked = nanMsgsAcked.get(),
+            nanMsgSendsFailed = nanMsgSendsFailed.get(),
+            nanMsgPlaneStalledPeakMs = nanMsgPlaneStalledPeakMs.get(),
+            nanMsgPlaneCycles = nanMsgPlaneCycles.get(),
+            nanBulkGraceTimeouts = nanBulkGraceTimeouts.get(),
+        )
+
+    /** The [Snapshot.FastPath] counters alone, read now. */
+    fun fast(): Snapshot.FastPath =
+        Snapshot.FastPath(
+            fastCompactSent = fastCompactSent.get(),
+            fastLegacySent = fastLegacySent.get(),
+            fastFragSent = fastFragSent.get(),
+            fastReassembled = fastReassembled.get(),
+            fastTooBig = fastTooBig.get(),
+            fastTranscodedSent = fastTranscodedSent.get(),
+            transcodeFallbacks = transcodeFallbacks.get(),
+            fastDropsByReason = fastDrops.mapValues { it.value.get() }.filterValues { it > 0 },
+        )
+
+    /** The [Snapshot.Spool] counters alone, read now. */
+    fun spool(): Snapshot.Spool =
+        Snapshot.Spool(
+            spoolTablesDerived = spoolTablesDerived.get(),
+            spoolPushed = spoolPushed.get(),
+            spoolPulled = spoolPulled.get(),
+            spoolBridged = spoolBridged.get(),
+            spoolInvalid = spoolInvalid.get(),
+            spoolAccounted = spoolAccounted.get(),
+            spoolErrors = spoolErrors.get(),
+            spoolAttachPushed = spoolAttachPushed.get(),
+            spoolAttachPulled = spoolAttachPulled.get(),
+            spoolAttachDeferred = spoolAttachDeferred.get(),
+            spoolAttachRefused = spoolAttachRefused.get(),
+        )
+
+    /** The [Snapshot.Lora] counters alone, read now. */
+    fun lora(): Snapshot.Lora =
+        Snapshot.Lora(
+            loraSent = loraSent.get(),
+            loraFragSent = loraFragSent.get(),
+            loraTranscoded = loraTranscoded.get(),
+            loraPadded = loraPadded.get(),
+            loraReceived = loraReceived.get(),
+            loraReassembled = loraReassembled.get(),
+            loraTooBig = loraTooBig.get(),
+            loraDroppedQueue = loraDroppedQueue.get(),
+            loraAirtimeHeld = loraAirtimeHeld.get(),
+            loraAirtimeHeldByBucket = loraAirtimeHeldByBucket.mapValues { it.value.get() },
+            loraSuppressed = loraSuppressed.get(),
+            loraNak = loraNak.get(),
+            loraNakByReason = loraNakByReason.mapValues { it.value.get() },
+            loraSessionUps = loraSessionUps.get(),
+            loraDmSent = loraDmSent.get(),
+            loraDmReceived = loraDmReceived.get(),
+            loraReoffered = loraReoffered.get(),
+            loraProfileRefanSkipped = loraProfileRefanSkipped.get(),
+            loraOfferSent = loraOfferSent.get(),
+            loraOfferReceived = loraOfferReceived.get(),
+            loraBridged = loraBridged.get(),
+            loraBridgeRefused = loraBridgeRefused.get(),
+            loraPassive = loraPassive.get(),
+            loraSkippedLinked = loraSkippedLinked.get(),
+            loraSkippedInternet = loraSkippedInternet.get(),
+            loraUnheardHeld = loraUnheardHeld.get(),
+            loraDmProbes = loraDmProbes.get(),
+            loraStaleAtSend = loraStaleAtSend.get(),
+            loraStaleAtSendByReason = loraStaleAtSendByReason.mapValues { it.value.get() },
+            loraTickDeferred = loraTickDeferred.get(),
+        )
+
+    /** The [Snapshot.Meshtastic] counters alone, read now. */
+    fun meshtastic(): Snapshot.Meshtastic =
+        Snapshot.Meshtastic(
+            meshPostHeard = meshPostHeard.get(),
+            meshPostIngested = meshPostIngested.get(),
+            meshPostViaMqtt = meshPostViaMqtt.get(),
+            meshPostMatched = meshPostMatched.get(),
+            meshPostVerified = meshPostVerified.get(),
+            meshPostBoardVerified = meshPostBoardVerified.get(),
+            meshPostSignatureMismatch = meshPostSignatureMismatch.get(),
+            meshPostRefusedByReason = meshPostRefusedByReason.mapValues { it.value.get() },
+            publicPostSent = publicPostSent.get(),
+            publicPostRefusedByReason = publicPostRefusedByReason.mapValues { it.value.get() },
+            autoReplyHeard = autoReplyHeard.get(),
+            autoReplySent = autoReplySent.get(),
+            autoReplyRefusedByReason = autoReplyRefusedByReason.mapValues { it.value.get() },
+        )
+
+    /**
+     * Every counter, read at once, in groups. The groups are load-bearing: a data class's synthetic default
+     * constructor takes two JVM parameter slots for each `Long`, and a method may take at most 255. A flat snapshot
+     * reached that at 129 counters, and one more fails at class load (`ClassFormatError: Too many arguments in method
+     * signature`), not at compile time, crashing every test that touches the class. A new counter goes into its group,
+     * and `MeshMetricsTest` fails a group that nears the limit. A counter keeps its full name inside its group, so
+     * `snapshot().lora.loraSent` reads the same as the debug bridge's `loraSent` key.
+     */
+    data class Snapshot(
+        val frames: Frames = Frames(),
+        val keys: Keys = Keys(),
+        val seals: Seals = Seals(),
+        val receipts: Receipts = Receipts(),
+        val groups: Groups = Groups(),
+        val files: Files = Files(),
+        val bluetooth: Bluetooth = Bluetooth(),
+        val nan: Nan = Nan(),
+        val fast: FastPath = FastPath(),
+        val spool: Spool = Spool(),
+        val lora: Lora = Lora(),
+        val meshtastic: Meshtastic = Meshtastic(),
+    ) {
+        /** What the router did with frames — authored, delivered, relayed, handed on, suppressed, deduped, dropped
+         * (by [DropReason]) — the bytes it put on the wire, and the sync rounds around them: heal passes, and digests a
+         * newer one replaced in a link's queue. */
+        data class Frames(
+            val framesOriginated: Long = 0,
+            val framesDelivered: Long = 0,
+            val framesRelayed: Long = 0,
+            val framesHandedOn: Long = 0,
+            val framesSuppressed: Long = 0,
+            val framesDeduped: Long = 0,
+            val bytesSent: Long = 0,
+            val framesDropped: Long = 0,
+            val dropsByReason: Map<DropReason, Long> = emptyMap(),
+            val digestsReplaced: Long = 0,
+            val healsCompleted: Long = 0,
+        )
+
+        /**
+         * Recovering a sender's missing key: key requests, keys served and recovered, frames parked for a key and
+         * replayed, and the contact-card intros ([IntroSync]).
+         */
+        data class Keys(
+            val keyRequestsSent: Long = 0,
+            val keysServed: Long = 0,
+            val keysRecovered: Long = 0,
+            val framesHeld: Long = 0,
+            val framesReplayed: Long = 0,
+            val introsSent: Long = 0,
+            val introsAnswered: Long = 0,
+        )
+
+        /** How DMs and reactions were sealed, and how many fell back to an older form. */
+        data class Seals(
+            val dmSealedV2: Long = 0,
+            val dmSealedV3: Long = 0,
+            val dmSealedV1Fallback: Long = 0,
+            val reactionsSealed: Long = 0,
+            val reactionsSealedFallback: Long = 0,
+        )
+
+        /**
+         * Delivery ticks: sealed or sent cleartext, custodied, coalesced, ridden, spooled, re-sent, and the unsigned
+         * live-link form.
+         */
+        data class Receipts(
+            val receiptsResent: Long = 0,
+            val receiptsSealed: Long = 0,
+            val receiptsSealedFallback: Long = 0,
+            val receiptsCustodied: Long = 0,
+            val receiptsCoalesced: Long = 0,
+            val receiptsRidden: Long = 0,
+            val receiptsSpooled: Long = 0,
+            val ticksUnsigned: Long = 0,
+        )
+
+        /** Group messages, the seeds their keys travel in, key requests, and group roots. */
+        data class Groups(
+            val groupSealedRatchet: Long = 0,
+            val groupSealedV1Fallback: Long = 0,
+            val groupSeedsSent: Long = 0,
+            val groupSeedsAdopted: Long = 0,
+            val groupSeedsHeld: Long = 0,
+            val groupSeedsReplayed: Long = 0,
+            val groupKeyRequestsSent: Long = 0,
+            val groupRootsMinted: Long = 0,
+            val groupRootsAdopted: Long = 0,
+        )
+
+        /** Blobs over the radio links: files sent on each plane, blob asks handled, and cut transfers resumed (#116). */
+        data class Files(
+            val filesSentNan: Long = 0,
+            val filesSentBt: Long = 0,
+            val blobAsksHandled: Long = 0,
+            val carrierPullsDeferred: Long = 0,
+            val filesResumedOut: Long = 0,
+            val filesResumedIn: Long = 0,
+            val splicesRefused: Long = 0,
+            val blobQueriesSent: Long = 0,
+            val blobQueriesAnswered: Long = 0,
+            val blobQueriesRefused: Long = 0,
+            val blobAnswersTaken: Long = 0,
+            val blobAnswersIgnored: Long = 0,
+            val blobFetches: Long = 0,
+            val blobConfirms: Long = 0,
+            val blobFallbacks: Long = 0,
+            val blobBlindAsks: Long = 0,
+            val blobPullThroughs: Long = 0,
+            val blobAsksParked: Long = 0,
+            // Progress reports sent back to a file's sender, and taken from a file's receiver (ADR 2026-10.nsr7).
+            val blobProgressSent: Long = 0,
+            val blobProgressTaken: Long = 0,
+            // Asks withdrawn by a `blobcancel`, and withdrawals that dropped a parked ask or a queued copy (ADR 2026-10.nsr7).
+            val blobCancelsSent: Long = 0,
+            val blobCancelsTaken: Long = 0,
+        )
+
+        /**
+         * The BLE links — connect failures by [ConnectFailReason], links made, Coded PHY steps — and the side
+         * channel's pages ([BleSideDrop]).
+         */
+        data class Bluetooth(
+            val btConnectFails: Long = 0,
+            val btConnectFailsByReason: Map<ConnectFailReason, Long> = emptyMap(),
+            val btLinksEstablished: Long = 0,
+            val bleLinkDupSkipped: Long = 0,
+            val bleCodedSightings: Long = 0,
+            val bleCodedDials: Long = 0,
+            val blePhyStepsDown: Long = 0,
+            val blePhyStepsUp: Long = 0,
+            val blePhyGiveUps: Long = 0,
+            val bleCodedAdvertDark: Long = 0,
+            val bleSideOffered: Long = 0,
+            val bleSidePartsAired: Long = 0,
+            val bleSideTooBig: Long = 0,
+            val bleSideHeard: Long = 0,
+            val bleSideReassembled: Long = 0,
+            val bleSideDeduped: Long = 0,
+            val bleSideDropsByReason: Map<BleSideDrop, Long> = emptyMap(),
+        )
+
+        /** Wi-Fi Aware: serves, owed links, refused accepts, the message plane, and bulk-preference timeouts. */
+        data class Nan(
+            val nanServesPeak: Long = 0,
+            val nanOwedNoLinkPeakMs: Long = 0,
+            val nanAcceptsRefused: Long = 0,
+            val nanIcmKeepaliveFailed: Long = 0,
+            val nanOffScreenRefusals: Long = 0,
+            val nanMsgsAcked: Long = 0,
+            val nanMsgSendsFailed: Long = 0,
+            val nanMsgPlaneStalledPeakMs: Long = 0,
+            val nanMsgPlaneCycles: Long = 0,
+            val nanBulkGraceTimeouts: Long = 0,
+        )
+
+        /**
+         * The fast plane: frames sent compact, legacy, fragmented or transcoded, reassembled, too big, and dropped
+         * ([FastPathDrop]).
+         */
+        data class FastPath(
+            val fastCompactSent: Long = 0,
+            val fastLegacySent: Long = 0,
+            val fastFragSent: Long = 0,
+            val fastReassembled: Long = 0,
+            val fastTooBig: Long = 0,
+            val fastTranscodedSent: Long = 0,
+            val transcodeFallbacks: Long = 0,
+            val fastDropsByReason: Map<FastPathDrop, Long> = emptyMap(),
+        )
+
+        /** The Internet (spool) plane. */
+        data class Spool(
+            val spoolTablesDerived: Long = 0,
+            val spoolPushed: Long = 0,
+            val spoolPulled: Long = 0,
+            val spoolBridged: Long = 0,
+            val spoolInvalid: Long = 0,
+            val spoolAccounted: Long = 0,
+            val spoolErrors: Long = 0,
+            val spoolAttachPushed: Long = 0,
+            val spoolAttachPulled: Long = 0,
+            val spoolAttachDeferred: Long = 0,
+            val spoolAttachRefused: Long = 0,
+        )
+
+        /** The LoRa plane. */
+        data class Lora(
+            val loraSent: Long = 0,
+            val loraFragSent: Long = 0,
+            val loraTranscoded: Long = 0,
+            val loraPadded: Long = 0,
+            val loraReceived: Long = 0,
+            val loraReassembled: Long = 0,
+            val loraTooBig: Long = 0,
+            val loraDroppedQueue: Long = 0,
+            val loraAirtimeHeld: Long = 0,
+            val loraAirtimeHeldByBucket: Map<String, Long> = emptyMap(),
+            val loraSuppressed: Long = 0,
+            val loraNak: Long = 0,
+            val loraNakByReason: Map<String, Long> = emptyMap(),
+            val loraSessionUps: Long = 0,
+            val loraDmSent: Long = 0,
+            val loraDmReceived: Long = 0,
+            val loraReoffered: Long = 0,
+            val loraProfileRefanSkipped: Long = 0,
+            val loraOfferSent: Long = 0,
+            val loraOfferReceived: Long = 0,
+            val loraBridged: Long = 0,
+            val loraBridgeRefused: Long = 0,
+            val loraPassive: Long = 0,
+            val loraSkippedLinked: Long = 0,
+            val loraSkippedInternet: Long = 0,
+            val loraUnheardHeld: Long = 0,
+            val loraDmProbes: Long = 0,
+            val loraStaleAtSend: Long = 0,
+            val loraStaleAtSendByReason: Map<String, Long> = emptyMap(),
+            val loraTickDeferred: Long = 0,
+        )
+
+        /**
+         * The Meshtastic room: posts heard and ingested, what their signatures proved, posts sent, and the DM
+         * auto-reply.
+         */
+        data class Meshtastic(
+            val meshPostHeard: Long = 0,
+            val meshPostIngested: Long = 0,
+            val meshPostViaMqtt: Long = 0,
+            val meshPostMatched: Long = 0,
+            val meshPostVerified: Long = 0,
+            val meshPostBoardVerified: Long = 0,
+            val meshPostSignatureMismatch: Long = 0,
+            val meshPostRefusedByReason: Map<String, Long> = emptyMap(),
+            val publicPostSent: Long = 0,
+            val publicPostRefusedByReason: Map<String, Long> = emptyMap(),
+            val autoReplyHeard: Long = 0,
+            val autoReplySent: Long = 0,
+            val autoReplyRefusedByReason: Map<String, Long> = emptyMap(),
+        )
+    }
+}

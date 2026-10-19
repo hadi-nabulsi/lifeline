@@ -1,0 +1,191 @@
+package app.getknit.knit.data.message
+
+import java.security.MessageDigest
+
+/** The kind of conversation a thread belongs to — drives per-context notification channel routing. */
+enum class ConversationKind {
+    NEARBY,
+    GROUP,
+    DM,
+
+    /**
+     * The Meshtastic room ([Conversations.MESHTASTIC]) — the paired board's primary channel, and the only
+     * kind whose authors are not Knit peers at all. Separate from [NEARBY] because almost nothing Nearby means
+     * is true here: no presence, no open-to-chat, no receipts, no verified key, and a stranger's name on every
+     * post. Keeping the two apart is what stops any of that leaking either way.
+     */
+    MESHTASTIC,
+
+    /**
+     * A **commons** ([Conversations.COMMONS_PREFIX]) — a spool's shared room (docs/SPOOL_PROTOCOL.md §7.4),
+     * the private instance's group chat with every peer on that relay. Its authors are pinned Knit peers
+     * like a group's, but it has no roster and no ratchet: whoever holds the invite is in,
+     * every member shares the room key, and a post lives on the spool rather than in custody.
+     */
+    COMMONS,
+}
+
+/**
+ * Conversation identity helpers. A "conversation" groups messages into one thread: the public
+ * broadcast room ([NEARBY]), a 1:1 DM keyed by the *other* party's node id, or a group keyed by a
+ * [groupIdFor] id derived from its member set.
+ *
+ * Pure Kotlin with no Android dependencies so the mesh layer and the UI can share it (and it stays
+ * unit-testable on the JVM).
+ */
+object Conversations {
+    /** Stable id of the public broadcast room, surfaced in the chat list as "Nearby". */
+    const val NEARBY: String = "nearby"
+
+    /**
+     * Stable id of the **Meshtastic room** — the paired board's own primary (slot 0) channel, mirrored into a
+     * room on this phone and this phone only: what the board hears lands here, and what is typed here leaves
+     * through the board. Nothing in it ever crosses Knit's mesh.
+     *
+     * The hyphen is the same disjointness trick [GROUP_ID_PREFIX] uses: a node id is 26 characters of base32
+     * and can contain neither, so this can never collide with a DM thread. The `m-` shape leaves room for a
+     * second bridged channel later without re-litigating the namespace.
+     */
+    const val MESHTASTIC: String = "m-public"
+
+    /**
+     * The conversation a message belongs to, from [selfId]'s perspective. A group message ([groupId]
+     * non-null) belongs to that group's thread, regardless of sender. Otherwise: broadcast messages
+     * ([recipientId] null) belong to [NEARBY]; a DM belongs to a thread keyed by the other party —
+     * the [recipientId] for a message we sent, the [senderId] for one we received.
+     */
+    fun idFor(
+        senderId: String,
+        recipientId: String?,
+        selfId: String,
+        groupId: String? = null,
+    ): String =
+        when {
+            groupId != null -> groupId
+            recipientId == null -> NEARBY
+            senderId == selfId -> recipientId
+            else -> senderId
+        }
+
+    /**
+     * Whether an inbound chat addressed with [recipientId] is for us ([selfId]). Broadcast messages
+     * ([recipientId] null) are for everyone; a DM is only for its named recipient. A node that is
+     * merely relaying someone else's DM gets `false` and must not persist/notify/ack it.
+     *
+     * Group membership is decided separately by [isGroupMember] (a group's recipientId is null, so this
+     * helper would wrongly call every group message "for me").
+     */
+    fun isForMe(
+        recipientId: String?,
+        selfId: String,
+    ): Boolean = recipientId == null || recipientId == selfId
+
+    /** Whether [selfId] is in a group's [members] roster — the group analogue of [isForMe]. */
+    fun isGroupMember(
+        members: List<String>,
+        selfId: String,
+    ): Boolean = selfId in members
+
+    /**
+     * The [ConversationKind] of a thread, derived from its [conversationId]: the [NEARBY] room, a
+     * group (id prefixed [GROUP_ID_PREFIX]), or otherwise a 1:1 DM (a peer node id). Pure, so the
+     * notification layer can route by context without re-deriving from frame fields.
+     */
+    fun kindFor(conversationId: String): ConversationKind =
+        when {
+            conversationId == NEARBY -> ConversationKind.NEARBY
+            conversationId == MESHTASTIC -> ConversationKind.MESHTASTIC
+            conversationId.startsWith(GROUP_ID_PREFIX) -> ConversationKind.GROUP
+            conversationId.startsWith(COMMONS_PREFIX) -> ConversationKind.COMMONS
+            else -> ConversationKind.DM
+        }
+
+    /**
+     * Whether [conversationId] is a **room** — addressed to nobody, with no recipient to seal for. The rooms
+     * differ in almost everything else, so this exists for the handful of rules that genuinely turn on that
+     * shape: profanity screening (a room is read by people who did not choose its every author, so the
+     * lexical pass runs there and only there), retention by volume rather than by thread, and never being a
+     * message request. A commons counts: it is private to its invite, but inside it every member reads every
+     * post, and its posts are cleartext inside the room's seal exactly as the Nearby room's are on the air.
+     */
+    fun isPublicRoom(conversationId: String): Boolean =
+        conversationId == NEARBY || conversationId == MESHTASTIC || conversationId.startsWith(COMMONS_PREFIX)
+
+    /**
+     * Whether [conversationId] is an accepted/known chat rather than a stranger's **message request** —
+     * the single source of truth for the notify gate (`InboundPipeline`), the local retention sweep
+     * (`MeshManager`), and the Message Requests UI. Pure: the caller supplies the signals as sets so
+     * a per-conversation check and a whole-list partition share one rule. A public room ([isPublicRoom]) is
+     * always accepted (bounded by retention, never a request); a DM is accepted if it was explicitly
+     * accepted, if its peer is out-of-band verified (a DM's [conversationId] *is* the peer node id, so this
+     * is a set lookup), or if the user has authored a message in it.
+     *
+     * A [GROUP_ID_PREFIX] group id never matches a peer node id, so a group can't be accepted by those
+     * id lookups alone — but a group also inherits acceptance from *who has spoken in it*: if any
+     * [groupSenders] entry (a node id that has posted a message in the thread) is itself a known peer
+     * (accepted / verified / previously DM'd), the group isn't a stranger's cold request — someone you
+     * already talk to has messaged you there — so it goes straight to the chat list. Keyed on the sender,
+     * not mere membership: a stranger who merely *adds* you to a group alongside a contact stays a request
+     * until a known peer actually posts. A sender counts by the same three DM signals, so this can't accept
+     * a group nobody-you-know has spoken in. [groupSenders] defaults empty for DM/Nearby ids and for group
+     * checks made without the thread's senders in hand (those still need an explicit accept or a
+     * self-authored reply). Convergence-safe: a local presentation decision only (never folded into custody/relay).
+     */
+    fun isAccepted(
+        conversationId: String,
+        accepted: Set<String>,
+        verifiedNodeIds: Set<String>,
+        authoredConversationIds: Set<String>,
+        groupSenders: Set<String> = emptySet(),
+    ): Boolean =
+        isPublicRoom(conversationId) ||
+            conversationId in accepted ||
+            conversationId in verifiedNodeIds ||
+            conversationId in authoredConversationIds ||
+            (
+                kindFor(conversationId) == ConversationKind.GROUP &&
+                    groupSenders.any {
+                        it in accepted || it in verifiedNodeIds || it in authoredConversationIds
+                    }
+            )
+
+    /**
+     * Stable, order-agnostic id for a group defined by [members] (node ids). Derived from the sorted,
+     * de-duplicated member set, so every device — and anyone who re-creates the same set of people —
+     * resolves to the *same* group id rather than minting a duplicate thread. Prefixed [GROUP_ID_PREFIX]
+     * (whose hyphen never appears in a base32 node id) so it can't collide with the node ids or the
+     * [NEARBY] room in conversation-id space. Pure (SHA-256 over the canonical member string), like
+     * [app.getknit.knit.identity.NodeId.derive].
+     */
+    @Suppress("MagicNumber") // nibble math (4-bit shifts, 0xF masks) for hex encoding
+    fun groupIdFor(members: List<String>): String {
+        val canonical = members.toSortedSet().joinToString(separator = ",")
+        val digest =
+            MessageDigest
+                .getInstance("SHA-256")
+                .digest((GROUP_ID_SALT + canonical).encodeToByteArray())
+        val hex =
+            digest.take(GROUP_ID_BYTES).joinToString("") { byte ->
+                val v = byte.toInt()
+                "${HEX[(v shr 4) and 0xF]}${HEX[v and 0xF]}"
+            }
+        return GROUP_ID_PREFIX + hex
+    }
+
+    /** Prefix marking a derived group id; the hyphen guarantees it can't equal a node id. */
+    const val GROUP_ID_PREFIX: String = "g-"
+
+    /**
+     * Prefix marking a **commons** — a spool's shared room (docs/SPOOL_PROTOCOL.md §7.4), one per relay the
+     * user has joined, keyed as `c-` + the room's 64-hex scope id. The same hyphen trick as
+     * [GROUP_ID_PREFIX]: it can never be a node id, and `c-` never collides with `g-` or `m-`.
+     */
+    const val COMMONS_PREFIX: String = "c-"
+
+    /** The conversation id of the commons whose scope id is [scopeIdHex]. */
+    fun commonsIdFor(scopeIdHex: String): String = COMMONS_PREFIX + scopeIdHex
+
+    private const val GROUP_ID_SALT = "knit-group-id-v1:"
+    private const val GROUP_ID_BYTES = 12 // 24 hex chars — ample to avoid collisions
+    private const val HEX = "0123456789abcdef"
+}

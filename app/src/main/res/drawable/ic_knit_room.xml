@@ -1,0 +1,35 @@
+<!-- Positive Lifeline mesh mark. The room avatar supplies its own circular background;
+     this same mark is used by the Nearby notification avatar and status-bar icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+  <group
+      android:scaleX="0.025"
+      android:scaleY="0.025"
+      android:translateX="-0.7875"
+      android:translateY="-0.7875">
+    <path
+        android:pathData="M312,248 L312,775"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="113"
+        android:strokeLineCap="round"/>
+    <path
+        android:pathData="M312,775 L711,775"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="113"
+        android:strokeLineCap="round"/>
+    <path
+        android:pathData="M312,775 L437.5,648"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="27"
+        android:strokeLineCap="round"/>
+    <path
+        android:pathData="M391,648 a46.5,46.5 0 1,1 93,0 a46.5,46.5 0 1,1 -93,0 Z"
+        android:fillColor="#FFFFFF"/>
+  </group>
+</vector>

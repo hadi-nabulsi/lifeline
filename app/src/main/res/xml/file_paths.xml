@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider path-config. Exposes only cache subdirectories holding a file this app staged for an
+     outbound share:
+       apk/   — a shareable copy of our own APK, for the offline "Share Knit app" flow (ui/invite/ShareApk.kt)
+       crash/ — the one crash report the user chose to hand over (crash/CrashReports.exportForShare)
+       fieldlog/ — the field log as the user chose to hand it over (fieldlog/FieldLogExport.stage)
+
+     crash/ is a STAGING directory and deliberately NOT the crash store itself, which lives in
+     noBackupFilesDir (see crash/CrashEnvironment.crashStore). The provider must be able to hand out only
+     the report the user picked, never a window onto every report the device has kept. -->
+<paths>
+    <cache-path name="apk" path="apk/" />
+    <cache-path name="crash" path="crash/" />
+    <cache-path name="fieldlog" path="fieldlog/" />
+</paths>

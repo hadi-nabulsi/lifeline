@@ -1,0 +1,1337 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <string name="app_name">Lifeline</string>
+
+    <!-- Notification channel groups -->
+    <string name="notif_group_messages">Messages</string>
+    <string name="notif_group_app">App</string>
+
+    <!-- Mesh foreground service (App group) -->
+    <string name="mesh_channel_name">Mesh networking</string>
+    <string name="channel_status_desc">Keeps the mesh running while the app is in the background</string>
+
+    <!-- Connection &amp; error alerts (App group) -->
+    <string name="channel_alerts_name">Connection &amp; alerts</string>
+    <string name="channel_alerts_desc">Mesh connection changes and errors</string>
+    <!-- The Keystore refused to unwrap the storage key on a start; nothing was wiped (ADR 2026-10.47rw). -->
+    <string name="storage_alert_title">Lifeline couldn\'t start the mesh</string>
+    <string name="storage_alert_text">This phone\'s secure storage didn\'t respond, so Lifeline couldn\'t open your messages. Nothing was deleted. Tap to try again.</string>
+    <string name="storage_unavailable_title">Waiting for secure storage</string>
+    <string name="storage_unavailable_body">This phone\'s secure storage didn\'t respond, so Lifeline can\'t open your messages yet. Nothing was deleted. Try again in a moment — restarting the phone can also help.</string>
+    <string name="storage_unavailable_retry">Try again</string>
+    <string name="storage_unavailable_start_over">Start over</string>
+    <string name="storage_start_over_title">Start over on this phone?</string>
+    <string name="storage_start_over_body">Lifeline clears everything it holds on this phone: your identity, contacts, groups, messages and photos. It then sets up as new, and your contacts will see someone they don\'t know. If you saved a backup, you can restore it when Lifeline opens again. If the storage only needs time, Try again keeps everything.</string>
+    <string name="storage_start_over_action">Clear and start over</string>
+
+    <!-- Open to chat (App group): the nudge when someone nearby declares the same flag as you -->
+    <string name="channel_open_to_chat_name">Open to chat</string>
+    <string name="channel_open_to_chat_desc">Nudges when someone nearby is open to chat while you are too</string>
+    <string name="notif_open_to_chat_title_one">%1$s is nearby and open to chat</string>
+    <plurals name="notif_open_to_chat_title">
+        <item quantity="one">%d person nearby is open to chat</item>
+        <item quantity="other">%d people nearby are open to chat</item>
+    </plurals>
+    <string name="notif_open_to_chat_body_one">Say hi in the Nearby room</string>
+    <string name="notif_open_to_chat_names_two">%1$s and %2$s</string>
+    <plurals name="notif_open_to_chat_names_more">
+        <item quantity="one">%1$s and %2$d other</item>
+        <item quantity="other">%1$s and %2$d others</item>
+    </plurals>
+
+    <!-- Message channels (Messages group) -->
+    <string name="channel_nearby_name">Nearby</string>
+    <string name="channel_nearby_desc">Messages in the public Nearby room</string>
+    <string name="channel_groups_name">Group messages</string>
+    <string name="channel_groups_desc">Messages in your group chats</string>
+    <string name="channel_dms_name">Direct messages</string>
+    <string name="channel_dms_desc">Private 1:1 messages</string>
+    <string name="channel_meshtastic_name">Meshtastic public channel</string>
+    <string name="channel_meshtastic_desc">Posts on your Meshtastic radio\'s primary channel</string>
+    <string name="channel_commons_name">Commons</string>
+    <string name="channel_commons_desc">Posts in a relay\'s shared room</string>
+    <string name="mention_channel_name">Mentions</string>
+    <string name="mention_channel_description">Notifications when someone @-mentions you</string>
+
+    <!-- Notification conversation titles (per channel) -->
+    <string name="notif_title_nearby">Nearby</string>
+    <string name="notif_title_meshtastic">Meshtastic</string>
+    <string name="notif_self_name">You</string>
+    <!-- A chat a shortcut or a notification opens after it was deleted, blocked or left: the toast, and the message
+         a disabled home-screen shortcut shows when tapped (ADR 2026-10.jbsa) -->
+    <string name="chat_gone">That chat is no longer on this phone</string>
+
+    <!-- Notification quick actions + group summary (Signal-style) -->
+    <string name="notif_action_reply">Reply</string>
+    <string name="notif_reply_hint">Message</string>
+    <string name="notif_action_mark_read">Mark read</string>
+    <string name="notif_summary">%1$d messages in %2$d chats</string>
+
+    <!-- Message requests (coalesced heads-up) -->
+    <string name="channel_requests_name">Message requests</string>
+    <string name="channel_requests_desc">Alerts you when someone new messages you</string>
+    <string name="notif_requests_title">Message request received</string>
+    <plurals name="notif_requests_body">
+        <item quantity="one">%d message request</item>
+        <item quantity="other">%d message requests</item>
+    </plurals>
+
+    <!-- Onboarding: three pages — welcome, name, permissions -->
+    <string name="onboarding_title">Welcome to Lifeline</string>
+    <string name="onboarding_tagline">Talk to people nearby — no account, no internet needed.</string>
+    <string name="onboarding_how_hop_title">Phone to phone</string>
+    <string name="onboarding_how_hop_body">Phones in range link up over Wi-Fi and Bluetooth. Messages hop from one to the next — no network in between.</string>
+    <string name="onboarding_how_sealed_title">Sealed end to end</string>
+    <string name="onboarding_how_sealed_body">Direct messages and groups are encrypted end to end — the phones that carry them can\'t read them. The Nearby room is open to everyone in range.</string>
+    <string name="onboarding_how_carry_title">Carried by the crowd</string>
+    <string name="onboarding_how_carry_body">Your phone holds sealed messages for others and hands them on when it meets the right phone. That\'s how a message crosses a crowd without a server.</string>
+    <string name="onboarding_get_started">Get started</string>
+    <string name="onboarding_continue">Continue</string>
+    <string name="onboarding_step_of">Step %1$d of %2$d</string>
+    <string name="onboarding_name_title">What should people call you?</string>
+    <string name="onboarding_name_body">This is the name people nearby see. Leave it blank to go by your alias for now — you can change it any time in your profile.</string>
+    <string name="onboarding_name_skip">Skip for now</string>
+    <string name="onboarding_permissions_title">Let Lifeline find phones nearby</string>
+    <string name="onboarding_perm_nearby_title">Nearby devices</string>
+    <string name="onboarding_perm_nearby_body">Finds phones in range over Wi-Fi Aware and Bluetooth.</string>
+    <string name="onboarding_perm_location_bt_title">Location and Bluetooth</string>
+    <string name="onboarding_perm_location_title">Location</string>
+    <string name="onboarding_perm_location_body">Android ties scanning for nearby phones to location. Lifeline uses it to find phones, and reads where you are only if you send your location.</string>
+    <string name="onboarding_perm_notifications_title">Notifications</string>
+    <string name="onboarding_perm_notifications_body">Tells you when a message arrives while Lifeline is in the background.</string>
+    <string name="onboarding_perm_battery_title">Background battery use</string>
+    <string name="onboarding_perm_battery_body">Keeps the mesh running with the screen off. Without it, Android may pause Lifeline until you open it again.</string>
+    <string name="onboarding_perm_denied_hint">Android won\'t ask again — allow it in Settings.</string>
+    <string name="onboarding_perm_denied_hint_family_link">Android won\'t ask again — allow it in Settings. If Settings greys it out as \"Disabled by admin\", a parent turned it off in Family Link; they can allow it under Controls › Signed-in devices › App permissions.</string>
+    <string name="onboarding_perm_denied_hint_managed">Android won\'t ask again — allow it in Settings. If Settings greys it out as \"Disabled by admin\", whoever manages this phone turned it off, and only they can allow it.</string>
+    <string name="onboarding_perm_battery_restricted_hint">Lifeline is currently set to Restricted, so the mesh stops when you leave Lifeline. Pick Optimized or Unrestricted under App battery usage.</string>
+    <string name="onboarding_perm_unused_title">Keep permissions while unused</string>
+    <string name="onboarding_perm_unused_body">Android takes an app\'s permissions back after a few months without use. Meshing counts as use, so this only matters if you stop the mesh and leave Lifeline alone for a while.</string>
+    <string name="onboarding_perm_unused_hint">Turn off \"Pause app activity if unused\" on Lifeline\'s app info page.</string>
+    <string name="onboarding_optional">Optional</string>
+    <string name="onboarding_allow">Allow</string>
+    <!-- Screen-reader labels for the per-row buttons; %1$s is the row title ("Allow, Nearby devices") -->
+    <string name="onboarding_allow_desc">Allow, %1$s</string>
+    <string name="onboarding_open_settings_desc">Open settings, %1$s</string>
+    <string name="onboarding_allowed">Allowed</string>
+    <string name="onboarding_unsupported">This phone has neither Wi-Fi Aware nor Bluetooth LE, so Lifeline can\'t reach phones nearby. You can still open the app and read what you already have.</string>
+    <string name="onboarding_start">Start meshing</string>
+
+    <!-- Chat -->
+    <string name="chat_more_options">More options</string>
+    <string name="chat_connection_none">No mesh nodes connected</string>
+    <plurals name="chat_connection_count">
+        <item quantity="one">Connected to %d mesh node</item>
+        <item quantity="other">Connected to %d mesh nodes</item>
+    </plurals>
+    <string name="chat_connection_radio_off">Turn on Wi-Fi or Bluetooth to connect</string>
+    <string name="chat_connection_airplane">Airplane mode is on — turn on Wi-Fi or Bluetooth</string>
+    <string name="chat_connection_degraded">Mesh radio unavailable — another app may be using it</string>
+    <string name="chat_connection_foreground_only">Wi-Fi searches for phones only while Lifeline is open</string>
+    <!--
+      Connection header, Internet plane. These two replace the mesh line only when the Internet plane is
+      carrying the conversation and the radios are not — saying "No mesh nodes connected" then would be
+      false, since messages are still moving. When both planes work the mesh line stands and the glyph
+      alone reports the Internet.
+    -->
+    <string name="chat_connection_relay_only">Relaying over Internet</string>
+    <string name="chat_connection_relay_no_radios">No nearby radios — relaying over Internet</string>
+    <!-- Spoken form of the header's Internet glyph, appended to the visible line for TalkBack. -->
+    <string name="chat_connection_relay_live_desc">Internet relays connected</string>
+    <string name="chat_connection_relay_down_desc">Internet relays not connected</string>
+    <!-- Spoken form of the header's LoRa-board glyph, appended the same way. -->
+    <string name="chat_connection_lora_live_desc">LoRa radio connected</string>
+    <string name="chat_connection_lora_down_desc">LoRa radio not connected</string>
+    <string name="chat_connection_desc">%1$s. %2$s</string>
+    <!-- Chat-list radio-off banner -->
+    <string name="chatlist_radio_banner_bluetooth_off">Bluetooth is off — tap to turn it on for better range and reliability</string>
+    <string name="chatlist_radio_banner_wifi_off">Wi-Fi is off — tap to turn it on for faster, longer-range mesh</string>
+    <string name="chatlist_radio_banner_all_off">Lifeline can\'t connect — turn on Wi-Fi or Bluetooth to reach people nearby</string>
+    <string name="chatlist_radio_banner_all_off_airplane">Airplane mode is on — turn it off or turn on Wi-Fi/Bluetooth to connect</string>
+    <string name="chatlist_radio_banner_dismiss">Dismiss</string>
+    <!-- Chat-list clone banner: this identity was seen running on another phone (one backup restored twice,
+         ADR 2026-09.ypcc). The dismiss means "the other phone is gone"; it comes back on fresh evidence. -->
+    <string name="chatlist_clone_banner_message">This account is also active on another phone. Messages reach only one of them at a time.</string>
+    <string name="chatlist_clone_banner_action">Sign out here</string>
+    <string name="chatlist_clone_banner_dismiss">The other phone is gone</string>
+    <!-- Chat-list mesh-paused banner: the user paused the mesh. %1$s is the clock time the pause ends
+         ("3:15 PM" / "Tue 3:15 PM"). -->
+    <string name="chatlist_mesh_paused_banner">Mesh paused until %1$s</string>
+    <string name="chatlist_mesh_paused_resume">Resume</string>
+    <!-- Chat-list mesh-stopped banner: the user stopped the mesh, and it stays stopped until they tap
+         Start again. -->
+    <string name="chatlist_mesh_stopped_banner">Mesh stopped</string>
+    <string name="chatlist_mesh_stopped_start">Start</string>
+    <string name="chat_empty">No messages yet.\nSay hello to nearby devices.</string>
+    <!-- Shown above the oldest loaded message while more of the conversation is being read in. -->
+    <string name="chat_loading_older">Loading earlier messages…</string>
+    <string name="chat_scroll_to_bottom">Scroll to newest message</string>
+    <string name="chat_message_hint">Lifeline Message</string>
+    <string name="chat_typing">%1$s is typing</string>
+    <string name="chat_typing_multiple">%1$s and others are typing</string>
+    <string name="chat_loading_photo">Photo appears once a device that has it is reachable</string>
+    <string name="chat_sending">Sending…</string>
+    <string name="chat_attachment_image_desc">Photo attachment</string>
+    <string name="chat_attachment_unavailable">Can\'t show this attachment</string>
+    <!--
+      Second line under a missing attachment's spinner (work item 50): whether the Internet plane can still
+      bring the bytes. The first line is always true, since the radios can always carry them; this one names
+      the connected relays only, so a photo relay that is down or switched off is never promised.
+    -->
+    <string name="chat_attachment_wait_relay">Can also arrive over the Internet through your relays</string>
+    <string name="chat_attachment_wait_frames_only">Your connected relays carry messages only</string>
+    <!--
+      In place of a missing attachment's first line while its bytes stream in over a nearby link (#115): how much
+      has crossed, against the size the sender's phone declared. The bytes alone when it declared none.
+    -->
+    <string name="chat_attachment_arriving">%1$s of %2$s</string>
+    <string name="chat_attachment_arriving_bytes">%1$s received</string>
+    <!-- Link previews: the card a sender's phone fetched for a link and sent with the message -->
+    <string name="chat_link_card_desc">Link preview: %1$s, %2$s</string>
+    <string name="chat_open_link">Open link</string>
+    <string name="chat_link_preview_loading">Loading preview…</string>
+    <string name="chat_link_staged_desc">Link preview: %1$s, %2$s. Tap the cross to send without it</string>
+    <string name="chat_view_photo">View photo</string>
+    <string name="chat_image_viewer_desc">Photo</string>
+    <string name="chat_image_saved">Saved to Pictures/Lifeline</string>
+    <string name="chat_image_save_failed">Couldn\'t save image</string>
+    <string name="chat_image_capture_failed">Couldn\'t attach that photo</string>
+    <string name="chat_attachment_preview_desc">Attachment preview</string>
+    <string name="chat_remove_attachment">Remove attachment</string>
+
+    <!-- File attachments -->
+    <string name="chat_attach_file">Send a file</string>
+    <string name="chat_file_loading">Waiting for the file</string>
+    <string name="chat_file_unnamed">File</string>
+    <string name="chat_file_save">Save</string>
+    <string name="chat_file_open">Open</string>
+    <string name="chat_file_saved">File saved</string>
+    <string name="chat_file_save_failed">Couldn\'t save that file</string>
+    <string name="chat_file_too_large">That file is over 8 MB, and files are sent as-is</string>
+    <string name="chat_file_package_refused">Lifeline doesn\'t send app packages</string>
+    <string name="chat_file_flagged">May contain sensitive content</string>
+    <string name="chat_file_risky_title">Save this file?</string>
+    <string name="chat_file_risky_body">Lifeline can\'t look inside %1$s. Open it only if you trust who sent it.</string>
+    <string name="chat_file_risky_confirm">Save anyway</string>
+    <string name="chat_share_needs_chat">Open a direct message or group chat to send a file</string>
+    <string name="chat_file_peer_too_old">Their version of Lifeline can\'t receive files</string>
+
+    <!-- Direct file transfer (transfer/): a large file over a one-shot Wi-Fi Direct link, never through the mesh -->
+    <string name="chat_send_large_file">Direct file send</string>
+    <string name="chat_transfer_needs_dm">Direct transfers work in a one-to-one chat</string>
+    <string name="chat_transfer_peer_too_old">Their version of Lifeline can\'t take direct transfers</string>
+    <string name="chat_transfer_peer_not_nearby">They have to be nearby, since the file goes straight from phone to phone</string>
+    <string name="chat_transfer_wifi_off">Turn on Wi-Fi to send a file directly</string>
+    <string name="chat_transfer_no_wifi_direct">This phone can\'t make a direct Wi-Fi connection</string>
+    <string name="chat_transfer_permission">Lifeline needs the nearby devices permission to transfer a file</string>
+    <string name="chat_transfer_busy">Another transfer is still running</string>
+    <string name="chat_transfer_unreadable">Lifeline couldn\'t read that file</string>
+    <string name="chat_transfer_too_large">That file is too large to send</string>
+    <string name="chat_transfer_no_session">Lifeline couldn\'t reach them to offer the file</string>
+    <string name="chat_transfer_no_space">Not enough free space for that file</string>
+    <string name="chat_transfer_hotspot">Turn off your hotspot or screen sharing first</string>
+    <string name="chat_transfer_background">Keep Lifeline on screen to send a file directly on this version of Android</string>
+    <string name="chat_transfer_gone">That offer is no longer open</string>
+    <string name="chat_transfer_incoming">Wants to send you this file</string>
+    <string name="chat_transfer_offered">Waiting for them to accept</string>
+    <string name="chat_transfer_accept">Accept</string>
+    <string name="chat_transfer_decline">Decline</string>
+    <string name="chat_transfer_cancel">Cancel</string>
+    <string name="chat_transfer_retry">Retry</string>
+    <string name="chat_transfer_open">Open</string>
+    <string name="chat_transfer_connecting">Connecting over Wi-Fi…</string>
+    <string name="chat_transfer_sending">Sending…</string>
+    <string name="chat_transfer_receiving">Receiving…</string>
+    <string name="chat_transfer_progress">%1$s of %2$s</string>
+    <string name="chat_transfer_sent">Sent</string>
+    <string name="chat_transfer_received">Received</string>
+    <string name="chat_transfer_declined">They declined</string>
+    <string name="chat_transfer_declined_by_you">You declined</string>
+    <string name="chat_transfer_declined_busy">They\'re already transferring a file</string>
+    <string name="chat_transfer_expired">No answer</string>
+    <string name="chat_transfer_cancelled">Cancelled</string>
+    <string name="chat_transfer_failed">Failed</string>
+    <string name="chat_transfer_failed_corrupt">Failed — the file didn\'t arrive intact</string>
+    <string name="chat_transfer_failed_connection">Failed — the Wi-Fi link dropped</string>
+    <string name="chat_transfer_failed_join">Failed — the direct Wi-Fi link never came up</string>
+    <string name="chat_transfer_failed_no_space">Failed — not enough free space</string>
+    <string name="chat_transfer_failed_timeout">Failed — no connection was made in time</string>
+    <string name="chat_transfer_failed_background">Failed — Lifeline must be on screen to send a file directly on this phone</string>
+    <string name="chat_transfer_interrupted">Interrupted</string>
+    <string name="chat_transfer_no_app">No app can open this file</string>
+    <string name="chat_transfer_consent_title_send">Send a file directly?</string>
+    <string name="chat_transfer_consent_title_receive">Receive this file?</string>
+    <string name="chat_transfer_consent_can_title">How it works</string>
+    <string name="chat_transfer_consent_can_body">Lifeline creates a private, encrypted Wi‑Fi connection between your phones. The file does not travel through the mesh, and other phones do not store or forward it.</string>
+    <string name="chat_transfer_consent_cannot_title">While the file transfers</string>
+    <string name="chat_transfer_consent_cannot_body">Lifeline pauses its Wi‑Fi mesh connection, so other messages may be delayed. Keep both phones nearby until the transfer finishes.</string>
+    <string name="chat_transfer_consent_scope_send">The file is encrypted while it travels. They will see its name and size before deciding whether to receive it, and either of you can stop the transfer at any time.</string>
+    <string name="chat_transfer_consent_scope_receive">The file is encrypted while it travels, then saved normally in your Downloads folder without Lifeline’s encryption. Lifeline does not scan files for harmful content, so only accept files you trust.</string>
+    <string name="chat_transfer_consent_accept">Continue</string>
+    <string name="chat_transfer_consent_decline">Not now</string>
+    <!-- The direct-transfer offer heads-up. Its own notification, so it wears the transfer mark. -->
+    <string name="notif_transfer_offer">Wants to send you %1$s</string>
+    <string name="notif_transfer_offer_sized">Wants to send you %1$s (%2$s)</string>
+
+    <!-- Voice notes -->
+    <string name="chat_voice_record">Hold to record a voice message</string>
+    <string name="chat_voice_record_start">Record a voice message</string>
+    <string name="chat_voice_record_stop">Stop recording</string>
+    <string name="chat_voice_recording">Recording</string>
+    <string name="chat_voice_slide_to_cancel">Slide to cancel</string>
+    <string name="chat_voice_cancel">Cancel recording</string>
+    <string name="chat_voice_record_failed">Couldn\'t record that voice message</string>
+    <string name="chat_voice_too_short">Hold the button to record</string>
+    <string name="chat_voice_mic_denied">Lifeline needs microphone access to record a voice message.</string>
+    <string name="chat_voice_mic_denied_title">Microphone access is off</string>
+    <string name="chat_voice_mic_denied_settings">Turn on the microphone for Lifeline in Settings to record voice messages. Lifeline uses it only while you\'re recording.</string>
+    <string name="chat_voice_play">Play voice message</string>
+    <string name="chat_voice_pause">Pause voice message</string>
+    <string name="chat_voice_loading">Voice message appears once a device that has it is reachable</string>
+    <string name="chat_voice_desc">Voice message, %1$s</string>
+    <string name="chat_voice_remove">Remove voice message</string>
+    <!-- Location sharing: the composer's pin reads the phone's position once, between the tap and the send -->
+    <string name="chat_attach_location">Send your location</string>
+    <string name="chat_location_finding">Finding your location…</string>
+    <string name="chat_location_accuracy">Accurate to %1$s</string>
+    <string name="chat_location_approximate">Rough, to about %1$s. Allow precise location for Lifeline in Settings to tighten it.</string>
+    <string name="chat_location_as_of">as of %1$s</string>
+    <string name="chat_location_failed">Couldn\'t get a fix. Try somewhere with a clear view of the sky.</string>
+    <string name="chat_location_retry">Try again</string>
+    <string name="chat_location_refresh">Refresh</string>
+    <string name="chat_location_off">Location is off on this phone</string>
+    <string name="chat_location_turn_on">Turn on</string>
+    <string name="chat_location_scope_chat">Sent only to this chat</string>
+    <string name="chat_location_scope_room">Everyone nearby will see your exact location</string>
+    <string name="chat_location_remove">Remove location</string>
+    <string name="chat_location_staged_desc">Your location, %1$s. Tap the cross to send without it</string>
+    <string name="chat_location_denied">Lifeline needs location access to send where you are.</string>
+    <string name="chat_location_denied_title">Location access is off</string>
+    <string name="chat_location_denied_settings">Turn on location for Lifeline in Settings to send where you are. Lifeline reads it only when you tap the pin.</string>
+    <!-- Appended to a permission's "Open settings" copy on a phone somebody else administers (ADR 2026-09.a8ud). -->
+    <string name="perm_denied_hint_family_link">If Settings greys it out as \"Disabled by admin\", a parent turned it off in Family Link — they can allow it under Controls › Signed-in devices › App permissions.</string>
+    <string name="perm_denied_hint_managed">If Settings greys it out as \"Disabled by admin\", whoever manages this phone turned it off, and only they can allow it.</string>
+    <string name="chat_location_not_ready">Still finding your location</string>
+    <string name="chat_location_card_label">Location</string>
+    <string name="chat_location_card_desc">Location: %1$s, %2$s</string>
+    <string name="chat_location_open_maps">Open in maps</string>
+    <string name="chat_location_copy">Copy coordinates</string>
+    <string name="chat_location_no_maps_app">No maps app on this phone. Coordinates copied instead.</string>
+    <string name="chat_location_consent_title">Send your location?</string>
+    <string name="chat_location_consent_can_title">What goes out</string>
+    <string name="chat_location_consent_can_body">Your exact position and how accurate it is, as a line in one message. Whoever receives it can open it in a maps app.</string>
+    <string name="chat_location_consent_cannot_title">When Lifeline reads it</string>
+    <string name="chat_location_consent_cannot_body">Only after you tap the pin, until you send or leave the chat. Never in the background.</string>
+    <string name="chat_location_consent_scope_chat">This goes only to the people in this chat, sealed like every other message here. Android may ask for permission next.</string>
+    <string name="chat_location_consent_scope_room">In the Nearby room everyone in radio range sees it, unencrypted, and phones that carry the room can pass it on to people who arrive over the next day. Android may ask for permission next.</string>
+    <string name="chat_location_consent_accept">Continue</string>
+    <string name="chat_location_consent_decline">Not now</string>
+    <string name="chat_self_name">You</string>
+    <string name="chat_status_sent">Sent</string>
+    <string name="chat_status_delivered">Delivered</string>
+    <!-- Group form: the ✓✓ flips on the FIRST member's ack, so the ratio is what the tick can't say -->
+    <string name="chat_status_delivered_count">Delivered to %1$d of %2$d</string>
+    <string name="chat_status_delivered_internet">Delivered over the Internet</string>
+    <string name="chat_status_arrived_internet">Arrived over the Internet</string>
+    <string name="chat_status_arrived_nearby">Arrived nearby</string>
+    <!-- LoRa plane (ADR 040): the frame, or the receipt that flipped the tick, crossed a Meshtastic board -->
+    <string name="chat_status_delivered_lora">Delivered over LoRa</string>
+    <string name="chat_status_arrived_lora">Arrived over LoRa</string>
+    <string name="chat_status_pending_key">Not sent yet — waiting for their key</string>
+    <string name="chat_time_just_now">Just now</string>
+    <string name="chat_action_copy">Copy text</string>
+    <string name="chat_action_reply">Reply</string>
+    <string name="chat_reply_photo">📷 Photo</string>
+    <string name="chat_reply_voice">🎤 Voice message</string>
+    <string name="chat_reply_cancel">Cancel reply</string>
+    <!-- Under a quote whose original this phone does not hold, so the quoted words are the sender's claim (ADR 2026-10.gpa3). -->
+    <string name="chat_quote_unverified">Unverified — original not on this phone</string>
+    <!-- In place of a quote that names a different author or thread than the original it points at. -->
+    <string name="chat_quote_unavailable">Quoted message unavailable</string>
+    <!-- In place of the quoted words while content filtering hides the reply; its body already says how to reveal. -->
+    <string name="chat_quote_hidden">Quoted message hidden</string>
+    <!-- The same, for a reply with no text of its own, so the quote carries the hint. -->
+    <string name="chat_quote_hidden_reveal">Quoted message hidden — tap to reveal</string>
+    <string name="chat_message_copied">Copied to clipboard</string>
+    <string name="chat_action_details">Message info</string>
+    <string name="chat_action_delete">Delete message</string>
+    <string name="chat_message_deleted">Message deleted</string>
+    <string name="chat_delete_confirm_title">Delete message?</string>
+    <string name="chat_delete_confirm_body">It will be removed from this device only.</string>
+    <string name="chat_delete_confirm_action">Delete</string>
+    <string name="chat_list_delete_action">Delete</string>
+    <string name="chat_list_delete_confirm_title">Delete chat?</string>
+    <string name="chat_list_delete_confirm_body">All messages in this chat will be removed from this device only.</string>
+    <string name="chat_list_clear_nearby_confirm_title">Clear Nearby messages?</string>
+    <string name="chat_list_clear_nearby_confirm_body">All Nearby messages will be removed from this device only. The room stays in your chat list.</string>
+    <string name="chat_action_block">Block user</string>
+    <string name="chat_action_unblock">Unblock user</string>
+    <string name="chat_view_profile">View %1$s\'s profile</string>
+    <string name="chat_view_group_info">View group info</string>
+    <string name="chat_sender_verified">You verified %1$s</string>
+    <string name="chat_group_settings">Settings</string>
+    <string name="chat_react_with">React with %1$s</string>
+    <string name="chat_react_more">More reactions</string>
+    <plurals name="chat_reaction_count">
+        <item quantity="one">%2$s, %1$d reaction</item>
+        <item quantity="other">%2$s, %1$d reactions</item>
+    </plurals>
+    <string name="chat_user_blocked">User blocked</string>
+    <string name="chat_user_unblocked">User unblocked</string>
+    <!-- The picker's @everyone row in a group: one mention per other member. A mention alerts; it promises no more. -->
+    <string name="chat_mention_everyone_hint">Mentions everyone else in this group and notifies them</string>
+
+    <!-- Emoji picker (the "more reactions" sheet) -->
+    <string name="emoji_search_hint">Search emoji</string>
+    <string name="emoji_search_clear">Clear search</string>
+    <string name="emoji_search_empty">No emoji match \u201c%1$s\u201d</string>
+    <string name="emoji_loading">Loading emoji</string>
+    <string name="emoji_empty_catalog">No emoji available on this device</string>
+    <string name="emoji_group_smileys">Smileys &amp; emotion</string>
+    <string name="emoji_group_people">People &amp; body</string>
+    <string name="emoji_group_animals">Animals &amp; nature</string>
+    <string name="emoji_group_food">Food &amp; drink</string>
+    <string name="emoji_group_travel">Travel &amp; places</string>
+    <string name="emoji_group_activities">Activities</string>
+    <string name="emoji_group_objects">Objects</string>
+    <string name="emoji_group_symbols">Symbols</string>
+    <string name="emoji_group_flags">Flags</string>
+
+    <!-- Group chat -->
+    <string name="group_unnamed">Group</string>
+    <plurals name="chat_group_member_count">
+        <item quantity="one">%d member</item>
+        <item quantity="other">%d members</item>
+    </plurals>
+    <string name="chat_group_rename">Rename group</string>
+    <string name="chat_group_set_photo">Set group photo</string>
+    <string name="chat_group_name_label">Group name</string>
+    <string name="chat_group_rename_action">Rename</string>
+    <string name="chat_group_leave">Leave group</string>
+    <string name="chat_group_leave_confirm_title">Leave group?</string>
+    <string name="chat_group_leave_confirm_body">You\'ll stop receiving messages and this chat will be removed from this device.</string>
+    <string name="chat_group_leave_confirm_action">Leave</string>
+    <string name="chat_notice_member_left">%1$s left the chat</string>
+    <string name="chat_notice_member_rejoined">%1$s rejoined the chat</string>
+
+    <!-- Status notices: centered, muted lines shown in a thread for an event rather than a message.
+         Derived on-device from state changes (see MessageEntity.kind); none of them crosses the wire. -->
+    <!-- %1$s is the contact's PREVIOUS name, %2$s their new one. -->
+    <string name="chat_notice_peer_renamed">%1$s is now %2$s</string>
+    <string name="chat_notice_peer_avatar">%1$s changed their photo</string>
+    <!-- %1$s is the member who renamed the group, %2$s the new group name. -->
+    <string name="chat_notice_group_renamed">%1$s renamed the group to %2$s</string>
+    <string name="chat_notice_group_photo">%1$s changed the group photo</string>
+    <string name="chat_notice_group_created">%1$s created this group</string>
+    <string name="chat_notice_group_created_you">You created this group</string>
+    <string name="chat_notice_key_pin_refused">A profile update for %1$s was refused: it didn\'t match their pinned key</string>
+    <string name="group_details_title">Group info</string>
+    <string name="group_details_members">Members</string>
+    <string name="group_details_view_photo">View photo</string>
+    <string name="group_details_fs_active">Messages here are sent with forward secrecy</string>
+    <string name="group_details_fs_waiting">Legacy encryption while %1$s can\'t use forward secrecy</string>
+    <string name="blocked_users_title">Blocked users</string>
+    <string name="blocked_users_empty">No blocked users</string>
+    <string name="blocked_users_unblock">Unblock</string>
+
+    <!-- Message requests -->
+    <string name="message_requests_title">Message requests</string>
+    <string name="message_requests_empty">No message requests</string>
+    <string name="message_requests_accept">Accept</string>
+    <string name="message_requests_accept_desc">Accept request from %1$s</string>
+    <string name="message_requests_more_desc">More options for %1$s</string>
+    <string name="message_requests_block">Block</string>
+    <string name="message_requests_block_confirm_title">Block this person?</string>
+    <string name="message_requests_block_confirm_body">You won\'t receive messages from them, and this request is removed.</string>
+    <string name="message_requests_delete_confirm_title">Delete request?</string>
+    <string name="message_requests_delete_confirm_body">This conversation will be removed from this device only.</string>
+
+    <!-- Donate -->
+    <string name="donate_title">Support Lifeline</string>
+    <string name="donate_blurb">Lifeline is free and funded entirely by tips — no ads, no servers, no tracking. If it\'s useful to you, a small donation helps keep development going.</string>
+    <string name="donate_kofi">Ko-fi</string>
+    <string name="donate_liberapay">Liberapay</string>
+    <string name="donate_github_sponsors">GitHub Sponsors</string>
+
+    <!-- Install offline (offline APK share) -->
+    <string name="share_app_menu">Install offline</string>
+    <string name="share_app_dialog_title">Install offline</string>
+    <string name="share_app_dialog_body">Send Lifeline to a nearby phone, even with no internet. Pick Quick Share or Bluetooth next. On the other phone, open the received file and allow installing it to finish.</string>
+    <string name="share_app_dialog_confirm">Share</string>
+    <string name="share_app_chooser_title">Install offline</string>
+    <!-- Shown while a Play (App Bundle / split) install is merged into one shareable APK — several seconds. -->
+    <string name="share_app_preparing">Preparing Lifeline to share…</string>
+    <string name="share_app_error">Couldn\'t share the app</string>
+    <string name="share_app_error_storage">Not enough free space to prepare Lifeline to share.</string>
+
+    <!-- Share Knit (Play Store link) -->
+    <string name="share_knit_menu">Share Lifeline</string>
+    <string name="share_knit_chooser_title">Share Lifeline</string>
+    <!-- %1$s = Play Store URL -->
+    <string name="share_knit_text">Lifeline is a free, offline mesh messenger — no servers, no accounts, no internet needed. Get it: %1$s</string>
+
+    <!-- Rate / review prompt -->
+    <string name="review_prompt_title">Enjoying Lifeline?</string>
+    <string name="review_prompt_body">You\'ve been meshing for a while now — how\'s it going?</string>
+    <string name="review_prompt_positive">Yes!</string>
+    <string name="review_prompt_negative">Not really</string>
+    <string name="review_menu">Rate Lifeline</string>
+
+    <!-- Share sheet target picker -->
+    <string name="share_target_title">Share to…</string>
+
+    <!-- Direct messages / contacts -->
+    <string name="contacts_title">New message</string>
+    <string name="contacts_new_message">New message</string>
+    <string name="contacts_empty">No contacts yet.\nSay hi in Nearby, scan someone\'s code, or add them from a contact link.</string>
+    <string name="contacts_start_chat">Start chat</string>
+    <string name="contacts_group_full">Groups can have up to %1$d people</string>
+
+    <!-- Chat list -->
+    <string name="nearby_title">Nearby</string>
+    <string name="meshtastic_title">Meshtastic</string>
+    <!-- A commons: a relay's shared room for everyone on it (its operator can name it; this is the fallback). -->
+    <string name="commons_title">Commons</string>
+    <string name="chat_list_empty_preview">No messages yet</string>
+    <!-- Chat list preview for a thread whose unsent draft is newer than its last message; %1$s is the draft. -->
+    <string name="chat_list_draft_preview">Draft: %1$s</string>
+    <string name="chat_list_hint_title">Get started</string>
+    <string name="chat_list_hint_body">Messages hop from phone to phone — no internet needed. Say hello in Nearby to reach everyone in range, or add a contact to message one person directly.</string>
+    <string name="chat_list_hint_nearby">Say hello</string>
+    <string name="chat_list_hint_add_contact">Add a contact</string>
+    <string name="chat_list_preview_photo">📷 Photo</string>
+    <string name="chat_list_preview_gif">🎞️ GIF</string>
+    <string name="chat_list_preview_voice">🎤 Voice message</string>
+    <string name="chat_list_preview_file">📎 %1$s</string>
+    <string name="chat_list_preview_link">🔗 Link</string>
+    <string name="chat_list_preview_location">📍 Location</string>
+
+    <!-- Chat-list previews for a direct-transfer row: phrased from the reader's side, so the list never
+         prefixes them with "You:". One per state the card can draw, plus the two that read differently
+         depending on which end you are. No emoji marker, unlike the previews above: the row draws the
+         feature's own mark (KnitIcons.DirectTransfer) beside the line instead, so the list and the menu
+         item show the same glyph. -->
+    <string name="chat_list_preview_transfer_offered">Offered %1$s</string>
+    <string name="chat_list_preview_transfer_incoming">Wants to send you %1$s</string>
+    <string name="chat_list_preview_transfer_connecting_send">Connecting to send %1$s</string>
+    <string name="chat_list_preview_transfer_connecting_receive">Connecting to receive %1$s</string>
+    <string name="chat_list_preview_transfer_sending">Sending %1$s</string>
+    <string name="chat_list_preview_transfer_receiving">Receiving %1$s</string>
+    <string name="chat_list_preview_transfer_sent">Sent %1$s</string>
+    <string name="chat_list_preview_transfer_received">Received %1$s</string>
+    <string name="chat_list_preview_transfer_declined">They declined %1$s</string>
+    <string name="chat_list_preview_transfer_declined_by_you">You declined %1$s</string>
+    <string name="chat_list_preview_transfer_expired">No answer about %1$s</string>
+    <string name="chat_list_preview_transfer_cancelled">Cancelled %1$s</string>
+    <string name="chat_list_preview_transfer_failed_send">Couldn\'t send %1$s</string>
+    <string name="chat_list_preview_transfer_failed_receive">Couldn\'t receive %1$s</string>
+    <string name="chat_list_preview_transfer_interrupted">Stopped partway through %1$s</string>
+    <string name="chat_attachment_with_size">%1$s · %2$s</string>
+    <string name="chat_list_preview_with_sender">%1$s: %2$s</string>
+    <plurals name="chat_list_unread_count">
+        <item quantity="one">%d unread message</item>
+        <item quantity="other">%d unread messages</item>
+    </plurals>
+
+    <!-- Search: the magnifier on the chat list and the screen behind it -->
+    <string name="search_title">Search</string>
+    <string name="search_hint">Search chats, people and messages</string>
+    <string name="search_clear">Clear search</string>
+    <string name="search_section_chats">Chats</string>
+    <string name="search_section_people">People</string>
+    <string name="search_section_messages">Messages</string>
+    <string name="search_idle">Find a chat, a person, or something someone said.</string>
+    <string name="search_keep_typing">Keep typing to search messages</string>
+    <string name="search_empty">No results for \u201c%1$s\u201d</string>
+
+    <!-- Settings, and your own profile behind the header row at the top of it. Two screens, so two titles;
+         the read-only view of somebody else is a third thing again, and its top bar carries the contact's
+         own name rather than a title string at all (ADR 2026-09.hknx). The
+         open-to-chat pair is `profile_`, not `settings_`, because it is a field peers read off your card. -->
+    <string name="settings_title">Settings</string>
+    <string name="profile_title">Profile</string>
+    <string name="profile_display_name_label">Display name</string>
+    <string name="profile_status_label">Status</string>
+    <string name="profile_node_id">Node ID: %1$s</string>
+    <string name="profile_alias">Alias: %1$s</string>
+    <string name="battery_allowed">Background battery use: allowed</string>
+    <string name="battery_optimized">Background battery use: optimized — Android may pause the mesh while the screen is off.</string>
+    <string name="battery_restricted">Background battery use: restricted — the mesh stops as soon as you leave Lifeline. Choose Optimized or Unrestricted to keep it running.</string>
+    <string name="battery_allow_button">Allow background battery use</string>
+    <string name="unused_pause_off">Permissions while unused: kept.</string>
+    <string name="unused_pause_on">Permissions while unused: Android takes them back after a few months without use. Meshing counts as use; turn off \"Pause app activity if unused\" to keep them regardless.</string>
+    <string name="settings_supervised_family_link">This phone is supervised with Family Link. Lifeline keeps meshing through app pauses and downtime; which permissions it can have is up to a parent.</string>
+    <string name="settings_supervised_managed">This phone is managed. Which permissions Lifeline can have is up to whoever manages it.</string>
+    <string name="profile_avatar_crop_hint">Drag and pinch to adjust</string>
+    <string name="profile_avatar_crop_desc">Adjust profile photo</string>
+    <string name="profile_change_photo_desc">Change profile photo</string>
+    <string name="profile_remove_photo_desc">Remove profile photo</string>
+    <string name="profile_photo_updated">Profile photo updated</string>
+    <string name="profile_photo_removed">Profile photo removed</string>
+    <string name="profile_open_to_chat_title">Open to chat</string>
+    <string name="profile_open_to_chat_subtitle">Let people nearby know you\'re up for a conversation. You\'ll both get a nudge when you\'re near each other.</string>
+    <!-- Section headings and bare row labels. `profile_node_id` / `profile_alias` above keep their
+         "Label: %s" sentence form for the surfaces that still draw one line (Settings' header row,
+         Add contact, Diagnostics); the two Profile screens use these labels in a label/value row. -->
+    <string name="profile_section_public">What people see</string>
+    <string name="profile_section_device">This device</string>
+    <string name="profile_node_id_label">Node ID</string>
+    <string name="profile_alias_label">Alias</string>
+    <string name="settings_content_filtering_title">Content filtering</string>
+    <string name="settings_content_filtering_subtitle">Hide explicit images and abusive messages you receive from others</string>
+    <string name="settings_theme_title">Theme</string>
+    <string name="settings_theme_subtitle">Lifeline follows your phone unless you override it here.</string>
+    <string name="settings_theme_system">System</string>
+    <string name="settings_theme_light">Light</string>
+    <string name="settings_theme_dark">Dark</string>
+    <string name="settings_dynamic_color_title">Dynamic colors</string>
+    <string name="settings_dynamic_color_subtitle">Color Lifeline from your wallpaper using Material You. Off keeps Lifeline\'s default.</string>
+    <string name="settings_link_previews_title">Link previews</string>
+    <string name="settings_link_previews_subtitle">When you type a link, Lifeline fetches the page\'s title and picture over the Internet and sends them with your message. The site sees your IP address; the people you send to never contact it.</string>
+
+    <!-- Profile details (another peer) -->
+    <string name="profile_details_message">Message</string>
+    <string name="profile_details_online">Online</string>
+    <string name="profile_details_indirect">Reachable indirectly</string>
+    <string name="profile_details_via_relay">Reachable long-range</string>
+    <string name="profile_details_offline">Offline</string>
+    <string name="profile_details_open_to_chat">Open to chat</string>
+    <string name="profile_details_view_photo">View photo</string>
+    <string name="profile_details_photo_desc">%1$s\'s profile photo</string>
+    <string name="profile_details_lora_label">LoRa radio</string>
+    <string name="profile_details_blocked">Blocked</string>
+    <string name="profile_details_section_in_common">In common</string>
+    <string name="profile_details_section_details">Details</string>
+    <!-- Historical, and short-range only: `met_peers` records a sighting of the peer\'s own radio, so a
+         contact reachable over LoRa or a relay may never have been met. Never word these "last seen" —
+         the presence badge is the only claim about now. -->
+    <string name="profile_details_first_met">First met</string>
+    <string name="profile_details_last_met">Last met</string>
+    <!-- Remove contact (ADR 2026-09.adgd): local only, nothing is sent. The DM thread goes, from this phone
+         only; a shared group keeps the person a contact, since only their own leave changes its roster. -->
+    <string name="profile_details_remove_contact">Remove contact</string>
+    <string name="profile_details_remove_title">Remove %1$s from contacts?</string>
+    <string name="profile_details_remove_body">%1$s leaves your contacts, and your chat with them is deleted from this phone. Lifeline doesn\'t notify them. If they write again, it arrives as a message request.</string>
+    <string name="profile_details_remove_body_kept">Your chat with %1$s is deleted from this phone, and a new message from them arrives as a message request. Lifeline doesn\'t notify them. They stay in your contacts while you\'re both in:</string>
+    <string name="profile_details_remove_verified">Their safety number goes back to not verified.</string>
+    <string name="profile_details_remove_action">Remove</string>
+    <string name="profile_details_remove_kept_title">%1$s stays in your contacts</string>
+    <string name="profile_details_remove_kept_body">Everyone in your groups is one of your contacts, so %1$s stays for as long as you\'re both in:</string>
+    <plurals name="profile_details_remove_more_groups">
+        <item quantity="one">and %d more group</item>
+        <item quantity="other">and %d more groups</item>
+    </plurals>
+
+    <!-- Encryption indicator in the chat header -->
+    <string name="chat_encrypted_desc">Encrypted</string>
+    <string name="chat_encryption_info_title">End-to-end encrypted</string>
+    <string name="chat_encryption_info_body">Messages in this chat are end-to-end encrypted — only the people in this conversation can read them.</string>
+
+    <!-- E2E key verification -->
+    <string name="verify_section_title">Encryption</string>
+    <string name="verify_verified">Verified</string>
+    <string name="verify_not_verified">Not verified</string>
+    <string name="verify_no_key">Encryption keys haven\'t been exchanged with this contact yet.</string>
+    <string name="verify_safety_number">Safety number</string>
+    <string name="verify_caption">Compare this number with %1$s in person, or scan their code, to confirm no one is intercepting your messages.</string>
+    <string name="verify_qr_caption">Let %1$s scan this code</string>
+    <string name="verify_scan">Scan their code</string>
+    <string name="verify_mark_verified">Mark as verified</string>
+    <string name="verify_clear">Clear verification</string>
+    <string name="verify_match">Verified — keys match.</string>
+    <string name="verify_mismatch">Codes don\'t match. This may not be the right contact.</string>
+
+    <!-- The in-person half of the "Add contact" screen (chat-list overflow › Add contact) -->
+    <string name="verify_standalone_caption">Show your code to someone nearby, or scan theirs, to add them as a verified contact — even if you\'ve never chatted.</string>
+    <string name="verify_qr_caption_generic">Let them scan this code</string>
+    <string name="verify_added">Verified — added to your contacts.</string>
+    <string name="verify_self">That\'s your own code.</string>
+    <string name="verify_invalid">That\'s not a Lifeline contact code.</string>
+
+    <!-- Contact links (docs/CONTACT_CARD.md): the identity QR as a shareable link, for people too far apart to scan. -->
+    <string name="contact_link_share">Share link</string>
+    <string name="contact_link_copy">Copy link</string>
+    <string name="contact_link_caption">Too far apart to scan? Send your link instead — the other person adds you from it, and you add them from theirs.</string>
+    <string name="contact_link_chooser_title">Share your contact link</string>
+    <string name="contact_link_share_text">Add me on Lifeline: %1$s</string>
+    <string name="contact_link_copied">Link copied</string>
+    <string name="add_contact_title">Add contact</string>
+    <string name="add_contact_link_title">Add by link</string>
+    <string name="add_contact_caption">Paste a contact link someone sent you, or open it from the message it arrived in. Send them yours too — it only connects once you\'ve both added the other\'s link.</string>
+    <string name="add_contact_input_label">Contact link</string>
+    <string name="add_contact_input_hint">https://getknit.app/c#…</string>
+    <string name="add_contact_paste">Paste</string>
+    <string name="add_contact_lookup">Continue</string>
+    <string name="add_contact_preview_title">Add %1$s?</string>
+    <string name="add_contact_safety_caption">Compare this number with %1$s over a call to be sure the link really came from them. You can also do that later from their profile.</string>
+    <string name="add_contact_confirm">Add contact</string>
+    <string name="add_contact_confirm_unblock">Unblock and add</string>
+    <string name="add_contact_importing">Adding…</string>
+    <string name="add_contact_already">%1$s is already in your contacts. Adding again just refreshes the connection.</string>
+    <string name="add_contact_blocked">You\'ve blocked this person.</string>
+    <string name="add_contact_relays_off">Internet relays are off, so you\'ll connect when you\'re nearby or over LoRa. Turn relays on in Settings to connect over the Internet.</string>
+    <string name="add_contact_relay_hint">%1$s uses a relay you don\'t. Add it to stay in touch over the Internet when neither of you is in radio range.</string>
+    <string name="add_contact_relay_add">Add</string>
+    <string name="add_contact_mismatch">This link\'s key doesn\'t match the one you already have for %1$s. Ask them to confirm their safety number.</string>
+    <string name="add_contact_invalid">That\'s not a Lifeline contact link.</string>
+    <string name="intro_status_awaiting_key">Waiting to reach %1$s — connects once their device is heard nearby, over LoRa, or through a relay. If you added them from a link, they need to add yours too.</string>
+    <string name="intro_status_waiting">Waiting for %1$s\'s device to answer.</string>
+    <string name="intro_status_connected">Connected — you can message each other over any path you share.</string>
+
+    <!-- QR scanner (camera) -->
+    <string name="scan_hint">Point the camera at the other person\'s code.</string>
+    <string name="scan_permission_denied">Lifeline needs camera access to scan a contact\'s code. You can turn it on in Settings.</string>
+    <string name="scan_no_camera">This device has no camera, so codes can\'t be scanned. You can still show your own code for someone else to scan.</string>
+
+    <!-- In-chat photo capture, and the states shared with the QR scanner above -->
+    <string name="camera_unavailable">The camera couldn\'t be opened. Close any other app using it and try again.</string>
+    <string name="camera_permission_denied">Lifeline needs camera access to take a photo. You can turn it on in Settings.</string>
+    <string name="camera_no_camera">This device has no camera, so there\'s nothing to take a photo with. You can still attach one from your photos.</string>
+    <string name="camera_capture_failed">That photo couldn\'t be taken. Try again.</string>
+    <string name="camera_capturing">Taking photo</string>
+    <string name="camera_switch_lens">Switch camera</string>
+
+    <!-- Diagnostics -->
+    <string name="diagnostics_title">Diagnostics</string>
+    <string name="diagnostics_self">This device</string>
+    <string name="diagnostics_supervised_family_link">Supervised with Family Link</string>
+    <string name="diagnostics_supervised_managed">Managed phone</string>
+    <string name="diagnostics_metrics">Mesh metrics</string>
+    <string name="diagnostics_directly_connected">Directly connected (%1$d)</string>
+    <string name="diagnostics_indirect">Reachable indirectly (%1$d)</string>
+    <string name="diagnostics_via_relay">Reachable long-range (%1$d)</string>
+    <string name="diagnostics_none_direct">No direct connections</string>
+    <string name="diagnostics_none_indirect">Nothing reachable indirectly</string>
+    <string name="diagnostics_none_relay">Nothing reachable long-range</string>
+    <string name="diagnostics_known_nodes">Known, not reachable (%1$d)</string>
+    <string name="diagnostics_known_more">…and %1$d more</string>
+    <string name="diagnostics_profile_age">Profile %1$s</string>
+    <string name="diagnostics_metric_originated">Originated</string>
+    <string name="diagnostics_metric_delivered">Delivered</string>
+    <string name="diagnostics_metric_relayed">Relayed</string>
+    <string name="diagnostics_metric_handed_on">Handed on</string>
+    <string name="diagnostics_metric_suppressed">Suppressed</string>
+    <string name="diagnostics_metric_deduped">Deduped</string>
+    <string name="diagnostics_metric_bytes_sent">Bytes sent</string>
+    <string name="diagnostics_metric_dropped">Dropped</string>
+    <string name="diagnostics_metric_key_requests">Key requests sent</string>
+    <string name="diagnostics_metric_keys_served">Keys served</string>
+    <string name="diagnostics_metric_keys_recovered">Keys recovered</string>
+    <string name="diagnostics_metric_intros_sent">Contact intros sent</string>
+    <string name="diagnostics_metric_intros_answered">Contact intros answered</string>
+    <string name="diagnostics_metric_frames_held">Frames held for key</string>
+    <string name="diagnostics_metric_frames_replayed">Frames replayed</string>
+    <string name="diagnostics_metric_receipts_resent">Receipts re-sent</string>
+    <string name="diagnostics_metric_dms_ratcheted">DMs sent forward-secret</string>
+    <string name="diagnostics_metric_dms_v1_fallback">DMs sent legacy (v1)</string>
+    <string name="diagnostics_metric_groups_ratcheted">Group messages sent forward-secret</string>
+    <string name="diagnostics_metric_groups_v1_fallback">Group messages sent legacy (v1)</string>
+    <string name="diagnostics_metric_group_seeds_sent">Group epoch seeds sent</string>
+    <string name="diagnostics_metric_group_seeds_adopted">Group epoch seeds adopted</string>
+    <string name="diagnostics_metric_receipts_sealed">Receipts sent sealed</string>
+    <string name="diagnostics_metric_receipts_sealed_fallback">Receipts sent cleartext (fallback)</string>
+    <string name="diagnostics_metric_receipts_custodied">Group ticks escalated to custody</string>
+    <string name="diagnostics_metric_reactions_sealed">Reactions sent sealed</string>
+    <string name="diagnostics_metric_reactions_sealed_fallback">Reactions sent cleartext (fallback)</string>
+    <string name="diagnostics_metric_bt_connect_fails">BT connect failures</string>
+    <string name="diagnostics_spools">Internet relays</string>
+    <string name="diagnostics_metric_spool_pushed">Messages sent to Internet relays</string>
+    <string name="diagnostics_metric_lora_sent">LoRa frames sent</string>
+    <string name="diagnostics_metric_lora_received">LoRa frames received</string>
+    <string name="diagnostics_metric_lora_reassembled">LoRa frames reassembled</string>
+    <string name="diagnostics_metric_lora_too_big">LoRa frames too large</string>
+    <string name="diagnostics_metric_lora_dropped">LoRa frames dropped (queue full)</string>
+    <string name="diagnostics_metric_lora_nak">LoRa NAKs</string>
+    <string name="diagnostics_metric_lora_dm_sent">LoRa private messages sent</string>
+    <string name="diagnostics_metric_lora_dm_received">LoRa private messages received</string>
+    <string name="diagnostics_metric_lora_reoffered">LoRa private messages re-offered</string>
+    <string name="diagnostics_metric_lora_dm_probes">LoRa private messages sent as a probe</string>
+    <string name="diagnostics_metric_lora_unheard_held">LoRa private messages held for an unheard contact</string>
+    <string name="diagnostics_metric_spool_bridged">Messages received via Internet relays</string>
+    <string name="diagnostics_metric_spool_invalid">Relay blobs quarantined</string>
+    <string name="diagnostics_metric_spool_errors">Relay errors</string>
+    <string name="diagnostics_metric_spool_attach_pushed">Photo chunks sent to Internet relays</string>
+    <string name="diagnostics_metric_spool_attach_pulled">Photos received via Internet relays</string>
+    <string name="diagnostics_metric_spool_attach_deferred">Photos left to nearby radios</string>
+    <string name="diagnostics_controls">Mesh controls</string>
+    <string name="diagnostics_status_healthy">Mesh status: Healthy</string>
+    <string name="diagnostics_status_degraded">Mesh status: Degraded</string>
+    <string name="diagnostics_status_degraded_hint">The radio may be in use by another app like Quick Share. Tap Restart mesh if it doesn\'t recover on its own.</string>
+    <string name="diagnostics_status_foreground_only">Mesh status: Wi-Fi search on screen only</string>
+    <string name="diagnostics_status_foreground_only_hint">On this version of Android, Lifeline can search for phones over Wi-Fi only while it is open; Bluetooth is unaffected. Opening Lifeline once keeps the Wi-Fi search going in the background.</string>
+    <string name="diagnostics_status_unavailable">Mesh status: Radios off</string>
+    <string name="diagnostics_status_unavailable_hint">Wi-Fi and Bluetooth are both off (or airplane mode is on). Turn one on to join the mesh.</string>
+    <!-- The same hint on a phone that only has one of the two radios, or neither — named so it never tells
+         someone to turn on a radio the Transports section below says they do not have. -->
+    <string name="diagnostics_status_unavailable_hint_ble_only">Bluetooth is off (or airplane mode is on). This phone has no Wi-Fi Aware, so Bluetooth is its only way onto the mesh. Turn it on to join.</string>
+    <string name="diagnostics_status_unavailable_hint_nan_only">Wi-Fi is off (or airplane mode is on). This phone has no Bluetooth LE, so Wi-Fi is its only way onto the mesh. Turn it on to join.</string>
+    <string name="diagnostics_status_unavailable_hint_no_radios">This phone has neither Wi-Fi Aware nor Bluetooth LE, so it can\'t reach phones nearby.</string>
+    <string name="diagnostics_restart_mesh">Restart mesh</string>
+    <string name="diagnostics_scan_now">Scan for nearby devices</string>
+    <string name="diagnostics_mesh_restarted">Mesh restarted</string>
+    <string name="diagnostics_scanning">Scanning for nearby devices…</string>
+    <string name="diagnostics_transports">Transports</string>
+    <string name="diagnostics_none_transports">No active transports</string>
+    <string name="diagnostics_transport_bluetooth">Bluetooth</string>
+    <string name="diagnostics_transport_wifi_aware">Wi-Fi Aware</string>
+    <string name="diagnostics_transport_other">Other</string>
+    <string name="diagnostics_transport_lora">LoRa</string>
+    <string name="diagnostics_transport_counts">%1$d nearby · %2$d linked</string>
+    <string name="diagnostics_transport_heard">%1$d heard</string>
+    <!-- Where the counts go on a plane the phone cannot run, or a LoRa plane with a board that is bound but
+         not up (no board at all reads lora_status_off, shared with the LoRa screen). -->
+    <string name="diagnostics_transport_unsupported">Not supported by this phone</string>
+    <string name="diagnostics_transport_needs_android_12">Needs Android 12 or newer</string>
+    <string name="diagnostics_transport_lora_down">Board not connected</string>
+    <string name="diagnostics_tag_ble">BLE</string>
+    <string name="diagnostics_tag_nan">NAN</string>
+    <string name="diagnostics_tag_lora">LoRa</string>
+    <string name="diagnostics_tag_spool">Internet</string>
+    <!-- An indirect row's tag: the nearby phone that last handed us this peer's message, by name. -->
+    <string name="diagnostics_tag_via">via %1$s</string>
+    <string name="diagnostics_transport_audio">audio</string>
+    <!-- The Wi-Fi Aware initiator hold (ADR 2026-09.m8kc): the row tag, and the section under Transports with
+         the way back. The plane itself is healthy — only this phone's own connection attempts are stopped. -->
+    <string name="diagnostics_transport_held">on hold</string>
+    <string name="diagnostics_nan_hold_label">Wi-Fi Aware connections are on hold</string>
+    <string name="diagnostics_nan_hold_body">This phone\'s Wi-Fi dropped each time Lifeline tried to open a Wi-Fi Aware connection to a nearby phone, so Lifeline stopped opening them from here. Nearby phones can still connect to this one, and Lifeline tries again once a day.</string>
+    <string name="diagnostics_nan_hold_retry_action">Try again now</string>
+    <string name="diagnostics_nan_hold_retry_done">Trying Wi-Fi Aware connections again</string>
+    <!-- Debug builds only: the diagnostic cap on Bluetooth links (SettingsStore.debugBleLinkCap). -->
+    <string name="diagnostics_ble_link_cap_label">Bluetooth link limit (debug)</string>
+    <string name="diagnostics_ble_link_cap_body">This phone holds at most this many Bluetooth links. Other nearby phones stay unlinked over Bluetooth.</string>
+    <string name="diagnostics_ble_link_cap_default">Default (%1$d)</string>
+    <string name="diagnostics_ble_link_cap_decrease">Fewer Bluetooth links</string>
+    <string name="diagnostics_ble_link_cap_increase">More Bluetooth links</string>
+    <!-- Debug builds only: the Wi-Fi Aware switch (SettingsStore.debugNanOff), and the tag its transport row wears while off. -->
+    <string name="diagnostics_nan_switch_label">Wi-Fi Aware (debug)</string>
+    <string name="diagnostics_nan_switch_body">Turn off to run the mesh on Bluetooth alone. Stays off after a restart until you turn it back on.</string>
+    <string name="diagnostics_transport_debug_off">off</string>
+    <string name="diagnostics_ble_phy_label">Long-range Bluetooth (experiment)</string>
+    <string name="diagnostics_ble_phy_body">Off is today\'s Bluetooth. Auto finds phones further away and slows a link down to keep it as they walk off. Coded and 1M hold every link on one speed, for comparing range.</string>
+    <string name="diagnostics_ble_phy_off">Off</string>
+    <string name="diagnostics_ble_phy_auto">Auto</string>
+    <string name="diagnostics_ble_phy_coded">Coded</string>
+    <string name="diagnostics_ble_phy_one_m">1M</string>
+    <string name="diagnostics_phy_1m">1M</string>
+    <string name="diagnostics_phy_2m">2M</string>
+    <string name="diagnostics_phy_coded">Coded</string>
+    <string name="diagnostics_phy_cd">Bluetooth link on the %1$s PHY</string>
+
+    <!-- Your mesh (ui/yourmesh): what keeping Knit running has done for the people around this phone, in
+         plain words. Every number is counted on this phone and never leaves it. "Passed along" is a message
+         frame this phone sent on for someone else; "handed straight to" is one it sent over a live link to
+         the person it was for — a hand-off, not a confirmed delivery, which is why nothing here says
+         "delivered". A carrier cannot tell a message from a sealed receipt or reaction (ADR 018), so those
+         count as messages; nor can it tell a delivered one from an undelivered one (a sealed receipt never
+         purges custody), so "carrying" is what this phone holds and would re-serve, delivered or not — the
+         hint says so. "Met" is a phone this one has been in radio range of. -->
+    <string name="your_mesh_title">Your mesh</string>
+    <!-- Click label of the chat-list header's status line, which opens this screen. -->
+    <string name="your_mesh_open">Open Your mesh</string>
+    <!-- The label under the hero's big number; the number is drawn separately, so no placeholder here. -->
+    <plurals name="your_mesh_nearby" tools:ignore="ImpliedQuantity">
+        <item quantity="one">person nearby</item>
+        <item quantity="other">people nearby</item>
+    </plurals>
+    <string name="your_mesh_status_connected">Your phone is part of the mesh right now.</string>
+    <string name="your_mesh_status_alone">No one in range right now. Lifeline keeps listening.</string>
+    <string name="your_mesh_status_radios_off">Turn on Wi-Fi or Bluetooth to reach people nearby.</string>
+    <string name="your_mesh_status_degraded">Another app has the radio. Lifeline picks up again when it lets go.</string>
+    <string name="your_mesh_status_foreground_only">Wi-Fi searches for phones only while Lifeline is open. Bluetooth keeps going.</string>
+    <string name="your_mesh_carrying_heading">Carrying now</string>
+    <plurals name="your_mesh_carrying">
+        <item quantity="one">%d message for other people</item>
+        <item quantity="other">%d messages for other people</item>
+    </plurals>
+    <string name="your_mesh_carrying_none">Nothing waiting right now</string>
+    <string name="your_mesh_carrying_hint">Other people\'s messages from the last day, kept so a phone that missed one can still pick it up here. Private messages stay sealed; this phone can\'t read them.</string>
+    <string name="your_mesh_lifetime_heading">All time</string>
+    <!-- %1$s is a date. -->
+    <string name="your_mesh_lifetime_since">Since %1$s</string>
+    <string name="your_mesh_passed_along">messages passed along for other people</string>
+    <string name="your_mesh_handed_direct">of those handed straight to the person they were for</string>
+    <string name="your_mesh_people_met">people this phone has met</string>
+    <string name="your_mesh_encouragement">Every phone running Lifeline carries messages for the phones around it. Leaving Lifeline on is how a message gets across a campsite or a crowd, including to people you never meet.</string>
+    <string name="your_mesh_encouragement_fresh">Every phone running Lifeline carries messages for the phones around it. Leave Lifeline on, and these numbers start to move the first time someone comes within range.</string>
+    <string name="your_mesh_technical_details">Technical details</string>
+
+    <!-- About (ui/about): the copyright line, the links out, and the build facts a bug report asks
+         for. Reached from Settings' overflow menu. Everything on it is a `BuildConfig` constant or an
+         `android.os.Build` field read once — see ADR 2026-09.6eb6 for why nothing from the build machine
+         may reach it (the release APK is byte-compared by F-Droid's buildserver). -->
+    <!-- Backup and restore (ui/backup/BackupScreen, docs/BACKUP_FORMAT.md). One screen, two halves: make a
+         backup file locked by a recovery key the app mints and never keeps, and restore one — which replaces
+         everything on the phone and restarts Knit. The onboarding door shows the restore half alone.
+         `backup_restore_confirm_named` / `_unnamed` take the backup's owner name (when it had one), its date
+         and the Knit version that wrote it; `backup_progress` two sizes already formatted for the locale. -->
+    <string name="settings_backup_title">Backup and restore</string>
+    <string name="settings_backup_subtitle">Keep your identity, contacts and messages in a file you control</string>
+    <!-- The clone notice's Settings row, shown only while the chat-list banner would show. -->
+    <string name="settings_clone_title">This account is also active on another phone</string>
+    <string name="settings_clone_subtitle">Two phones on one identity keep resetting each other\'s conversations. Keep one: sign out here, or stop using Lifeline on the other.</string>
+    <!-- "Sign out here" (both doors): ActivityManager.clearApplicationUserData — the app closes, everything
+         it holds on this phone goes, and the next open is a fresh install's onboarding. -->
+    <string name="signout_confirm_title">Sign out on this phone?</string>
+    <string name="signout_confirm_body">Lifeline closes and clears everything it holds on this phone: this identity, its contacts, groups, messages and photos. The other phone keeps all of it. When you open Lifeline here again it sets up a new identity and asks for its permissions again.</string>
+    <string name="signout_confirm_action">Sign out and clear</string>
+    <string name="backup_title">Backup and restore</string>
+    <string name="backup_restore_title">Restore from a backup</string>
+    <string name="backup_section_backup">Back up this phone</string>
+    <string name="backup_section_backup_body">Your identity, contacts, groups, messages and photos go into one encrypted file, saved wherever you choose. A recovery key locks it; Lifeline shows the key once and doesn\'t keep a copy, so nobody — Lifeline included — can open the file without it.</string>
+    <string name="backup_action_create">Create backup</string>
+    <string name="backup_key_intro">Your recovery key. Write it down or store it in a password manager before saving the file — it\'s the only way to open this backup.</string>
+    <string name="backup_key_copy">Copy recovery key</string>
+    <string name="backup_key_saved">I\'ve saved this key somewhere safe</string>
+    <string name="backup_action_save_file">Save backup file</string>
+    <string name="backup_writing">Writing the backup…</string>
+    <string name="backup_progress">%1$s of %2$s</string>
+    <string name="backup_written">Backup saved (%1$s). Keep the file and the key together with whoever will restore it — usually you, on your next phone.</string>
+    <string name="backup_failed">The backup wasn\'t saved: %1$s</string>
+    <string name="backup_section_restore">Restore a backup</string>
+    <string name="backup_section_restore_body">Bring an identity and its history onto this phone from a Lifeline backup file. Restoring replaces everything Lifeline has here and restarts the app. Use a backup on one phone at a time: two phones on the same identity keep resetting each other\'s conversations.</string>
+    <string name="backup_section_restore_body_onboarding">Moving from another phone? Pick the backup file you saved there and enter its recovery key. Lifeline restarts with your identity, contacts and messages in place. Use the backup on this phone only, and stop using Lifeline on the old one.</string>
+    <string name="backup_action_choose_file">Choose backup file</string>
+    <string name="backup_key_label">Recovery key</string>
+    <string name="backup_key_hint">30 digits; spaces don\'t matter</string>
+    <string name="backup_key_not_a_key">A recovery key is 30 digits</string>
+    <string name="backup_action_unlock">Open backup</string>
+    <string name="backup_restoring_reading">Checking the backup…</string>
+    <string name="backup_restore_ready">The backup opened and checks out.</string>
+    <string name="backup_restore_confirm_title">Restore this backup?</string>
+    <string name="backup_restore_confirm_named">Backup of %1$s from %2$s, made with Lifeline %3$s.</string>
+    <string name="backup_restore_confirm_unnamed">Backup from %1$s, made with Lifeline %2$s.</string>
+    <string name="backup_restore_confirm_body">Everything Lifeline holds on this phone — its identity, contacts, groups and messages — is replaced by the backup, and the app restarts. Your contacts see you as the same person; conversations with them pick up again as their phones reconnect. If the old phone still runs Lifeline, stop using it there.</string>
+    <string name="backup_action_restore">Restore and restart</string>
+    <string name="backup_restore_failed">The backup wasn\'t restored: %1$s</string>
+    <string name="backup_restarting">Restarting Lifeline…</string>
+    <string name="backup_problem_not_a_backup">this isn\'t a Lifeline backup file</string>
+    <string name="backup_problem_newer_app">it was made by a newer version of Lifeline — update Lifeline and try again</string>
+    <string name="backup_problem_wrong_key">the recovery key doesn\'t open it, or the file has changed since it was saved</string>
+    <string name="backup_problem_damaged">the file is incomplete or damaged</string>
+    <string name="backup_problem_no_space">this phone doesn\'t have enough free space</string>
+    <string name="backup_problem_keystore">this phone\'s secure storage didn\'t respond — try again in a moment</string>
+    <string name="backup_problem_io">the file couldn\'t be read or written</string>
+    <string name="onboarding_restore">Restore from a backup</string>
+
+    <string name="about_title">About Lifeline</string>
+    <string name="about_version">Version %1$s (%2$d)</string>
+    <string name="about_author">Jeffrey Walter Mixon</string>
+    <string name="about_copyright">Copyright © 2026 %1$s</string>
+    <string name="about_source_code">Source code</string>
+    <string name="about_source_code_subtitle">github.com/getknit/knit</string>
+    <string name="about_report_problem">Report a problem</string>
+    <string name="about_report_problem_subtitle">Open an issue on GitHub</string>
+    <string name="about_website">Website</string>
+    <string name="about_website_subtitle">getknit.app</string>
+    <string name="about_section_build">Build</string>
+    <string name="about_build_version">Version</string>
+    <string name="about_build_commit">Commit</string>
+    <string name="about_build_type">Build</string>
+    <string name="about_build_type_minified">%1$s · minified</string>
+    <string name="about_build_installed_from">Installed from</string>
+    <string name="about_install_source_play">Google Play</string>
+    <string name="about_install_source_fdroid">F-Droid</string>
+    <string name="about_install_source_sideloaded">Sideloaded (GitHub, a shared APK or another store)</string>
+    <string name="about_build_android">Android</string>
+    <string name="about_build_android_value">%1$s (SDK %2$d)</string>
+    <string name="about_build_device">Device</string>
+    <string name="about_copy_build_info">Copy build info</string>
+
+    <!-- Crash log — a manual, opt-in report the user reads and hands over themselves. Reached from
+         Diagnostics; nothing here is ever uploaded. See ui/diagnostics/CrashLogScreen.kt. -->
+    <string name="crash_section">Problem reports</string>
+    <string name="crash_last_label">Last crash</string>
+    <string name="crash_open_action">Open crash details</string>
+    <string name="crash_title">Last crash</string>
+    <string name="crash_when">Saved %1$s</string>
+    <string name="crash_empty">No crashes have been recorded on this phone.</string>
+    <string name="crash_explainer">Lifeline saved this on your phone the last time it closed unexpectedly. It stays here — nothing is sent anywhere unless you send it yourself.</string>
+    <string name="crash_native_note">Not every crash can be recorded. If Lifeline closed and nothing new turned up here, that\'s a kind of failure this can\'t capture — describe what you were doing instead.</string>
+    <string name="crash_trace_header">Details</string>
+    <string name="crash_action_report">Report on GitHub</string>
+    <string name="crash_action_copy">Copy</string>
+    <string name="crash_action_share">Share as a file</string>
+    <string name="crash_action_delete">Delete</string>
+    <string name="crash_copied">Copied</string>
+    <string name="crash_share_chooser_title">Send crash details</string>
+    <string name="crash_share_error">Couldn\'t prepare the file to share.</string>
+    <string name="crash_report_title">Report this on GitHub?</string>
+    <string name="crash_report_body">GitHub issues are public — anyone can read what you post. Lifeline removed ids, names and message text from this report before showing it to you, but read it over first. Your browser will open a bug form with the details filled in, and the full report will be on your clipboard to paste in.</string>
+    <string name="crash_report_confirm">Open the form</string>
+    <string name="crash_delete_title">Delete crash details?</string>
+    <string name="crash_delete_body">This removes every saved crash report from this phone. It can\'t be undone.</string>
+    <string name="crash_delete_confirm">Delete all</string>
+    <string name="crash_deleted">Crash details deleted</string>
+    <!-- The field log (ADR 2026-10.a239): a record of how the radios behaved, kept on the phone, shared only by the user. -->
+    <string name="field_log_section">Field data</string>
+    <string name="field_log_row_label">Field log</string>
+    <string name="field_log_row_supporting">How your radios have behaved over the last three days</string>
+    <string name="field_log_open_action">Open field log</string>
+    <string name="field_log_title">Field log</string>
+    <string name="field_log_explainer">When this is on, Lifeline keeps a short record of how this phone\'s radios behaved over the last three days: when links to other phones came and went, how strong they were, how fast files moved, and how long messages took. Sharing it with the Lifeline project helps tune Lifeline for the places people actually use it. It stays on this phone unless you share the file yourself.</string>
+    <string name="field_log_privacy_note">The file holds no names, messages, contacts, phone ids or locations. Other phones appear as short codes like p3f9a01c2, and those codes change when you clear the log.</string>
+    <string name="field_log_switch">Keep a field log</string>
+    <string name="field_log_switch_note">Turning this off also deletes what\'s kept.</string>
+    <plurals name="field_log_summary">
+        <item quantity="one">%1$d entry, %2$s</item>
+        <item quantity="other">%1$d entries, %2$s</item>
+    </plurals>
+    <plurals name="field_log_more">
+        <item quantity="one">…and %1$d more line in the file</item>
+        <item quantity="other">…and %1$d more lines in the file</item>
+    </plurals>
+    <string name="field_log_action_share">Share as a file</string>
+    <string name="field_log_share_chooser_title">Send field log</string>
+    <string name="field_log_preview_header">What\'s in the file</string>
+    <string name="field_log_empty">Nothing recorded yet. Entries appear once the mesh has been running for a minute.</string>
+    <string name="field_log_off">The field log is off. Turn it on to start recording.</string>
+    <string name="field_log_action_clear">Clear</string>
+    <string name="field_log_clear_title">Clear the field log?</string>
+    <string name="field_log_clear_body">This deletes everything the field log has kept on this phone. Recording starts over, with new codes for other phones.</string>
+    <string name="field_log_clear_confirm">Clear</string>
+    <string name="field_log_cleared">Field log cleared</string>
+
+    <!-- Diagnostics: the on-device model poison-pill (ADR 037). Plain language on purpose — "toxicity
+         classifier" means nothing to the person reading it, and the honest part is which chats lost what. -->
+    <string name="diagnostics_moderation_latched_label">Message checking is running reduced</string>
+    <string name="diagnostics_moderation_latched_body">Lifeline stopped using the on-device model that checks messages and photos, because loading it kept closing the app on this phone. Until it is back, messages are checked against the word lists only, and photos are not checked for explicit content.</string>
+    <string name="diagnostics_moderation_reset_action">Try the model again</string>
+    <string name="diagnostics_moderation_reset_title">Try the model again?</string>
+    <string name="diagnostics_moderation_reset_body">Lifeline will try to load it once more the next time it starts. If it closes the app again, Lifeline will turn it back off.</string>
+    <string name="diagnostics_moderation_reset_confirm">Try again</string>
+    <string name="diagnostics_moderation_reset_done">Lifeline will try the model again next time it starts</string>
+
+    <!-- Generic actions / content descriptions -->
+    <string name="action_send">Send</string>
+    <string name="action_attach_photo">Attach photo</string>
+    <string name="action_take_photo">Take photo</string>
+    <string name="action_open_settings">Open settings</string>
+    <string name="action_back">Back</string>
+    <string name="action_close">Close</string>
+    <string name="action_dismiss">Dismiss</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_save">Save</string>
+    <string name="action_copy">Copy</string>
+    <string name="action_copied">Copied</string>
+    <string name="action_done">Done</string>
+
+    <!-- Content moderation (on-device) -->
+    <string name="moderation_text_blocked">Message not sent: it may contain abusive language</string>
+    <string name="moderation_text_hidden">Message hidden — tap to reveal</string>
+    <string name="moderation_image_blocked">Explicit images can\'t be sent to the Nearby room</string>
+    <string name="moderation_image_hidden">Sensitive image — tap to view</string>
+    <string name="moderation_link_hidden">Sensitive preview — tap to view</string>
+    <!-- Stands in for a received message's text where it would be shown unasked (a notification, the chat
+         list's preview) while content filtering hides it in the thread. ADR 2026-10.9rh6. -->
+    <string name="moderation_preview_hidden">Message hidden</string>
+    <string name="moderation_photo_refused">This photo can\'t be used: it may contain explicit content</string>
+
+    <!--
+      Internet relays (the spool plane, docs/SPOOL_PROTOCOL.md).
+
+      Two rules hold this copy together. First, a relay refusal is never a failed send: the mesh still
+      carries the message, so every string here talks about *reach* ("nearby only", "not covered")
+      rather than failure. Second, the disclosure is deliberately concrete about what a relay observes
+      — vague reassurance would be the dishonest option for a feature that ships sealed bytes to a
+      machine the user does not hold.
+    -->
+    <string name="relays_title">Internet relays</string>
+    <string name="settings_internet_relays_title">Use Internet relays</string>
+    <string name="settings_internet_relays_subtitle">Keep conversations flowing when nobody is in radio range, by storing sealed copies on relay servers. Relays cannot read your messages, but they do see that a conversation is active and the IP addresses connecting to it.</string>
+    <string name="relays_summary_off">Off</string>
+    <string name="relays_summary_on">On · %1$d of %2$d connected</string>
+    <string name="relays_summary_none">On · no relays added</string>
+    <string name="relays_summary_none_active">On · no relays in use</string>
+    <string name="relays_section_list">Relays</string>
+    <string name="relays_off_note">Turning this off stops new uploads. Sealed copies already on a relay are unreadable to it and expire within 48 hours.</string>
+    <string name="relays_empty">No relays added. The Internet plane stays off until you add one — your messages still travel by Wi-Fi and Bluetooth.</string>
+    <string name="relays_add">Add relay</string>
+    <string name="relays_add_title">Add a relay</string>
+    <string name="relays_add_label">Relay address</string>
+    <string name="relays_add_hint">wss://host/spool/v1</string>
+    <string name="relays_add_invalid">Must start with wss://</string>
+    <string name="relays_add_duplicate">That relay is already in your list</string>
+    <!-- The commons (docs/SPOOL_PROTOCOL.md §7.4): a relay's shared room, joined with an invite from its operator. -->
+    <string name="relays_commons_label">Commons · %1$s</string>
+    <string name="relays_commons_join">Join</string>
+    <string name="relays_commons_leave">Leave</string>
+    <string name="relays_commons_join_title">Join %1$s</string>
+    <string name="relays_commons_join_body">This relay runs a shared room. Paste the invite its operator gave you. Everyone in the room becomes a contact, and their messages skip your requests inbox.</string>
+    <string name="relays_commons_invite_label">Invite</string>
+    <string name="relays_commons_invite_hint">knit-commons:v1:…</string>
+    <string name="relays_commons_invite_invalid">That is not a commons invite</string>
+    <string name="relays_commons_leave_body">The room and its history leave this phone. The people in it stay in your contacts.</string>
+    <string name="relays_remove">Remove</string>
+    <string name="relays_remove_desc">Remove relay %1$s</string>
+    <string name="relays_status_connected">Connected</string>
+    <string name="relays_status_connecting">Connecting…</string>
+    <string name="relays_status_off">Not in use</string>
+    <string name="relays_status_paused">Turned off</string>
+    <!-- The phone has no validated Internet route at all — about the phone, never the relay, so no red dot. -->
+    <string name="relays_status_offline">No Internet connection</string>
+    <!-- LoRa (Meshtastic-over-BLE) radio settings -->
+    <string name="lora_title">LoRa radio</string>
+    <string name="settings_lora_title">Use a LoRa radio</string>
+    <string name="settings_lora_subtitle">Extend the reach of the Nearby room and your private messages over long-range LoRa by pairing a Meshtastic board over Bluetooth. Groups, typing and photos stay on the phone-to-phone radios.</string>
+    <string name="lora_off_note">Turning this off closes the board connection. Groups and attachments never travel over LoRa.</string>
+    <string name="lora_dm_title">Private messages over LoRa</string>
+    <string name="lora_dm_subtitle">Direct messages stay end-to-end encrypted, but who is messaging whom, and when, is visible to any LoRa radio in range — kilometres, not metres. Turn this off to keep private messages on the phone-to-phone radios.</string>
+    <string name="lora_board_section">Board</string>
+    <string name="lora_board_none">No paired Meshtastic boards found. Pair one in Bluetooth settings first (the board shows a PIN on its screen).</string>
+    <string name="lora_board_none_meshtastic">None of your paired devices looks like a Meshtastic board. Pair one in Bluetooth settings, or show all paired devices.</string>
+    <string name="lora_show_all_boards">Show all paired devices</string>
+    <plurals name="lora_boards_hidden">
+        <item quantity="one">%d other paired device hidden</item>
+        <item quantity="other">%d other paired devices hidden</item>
+    </plurals>
+    <string name="lora_open_settings">Open Bluetooth settings</string>
+    <string name="lora_forget">Forget this board</string>
+    <string name="lora_setup_title">Set up this board for Lifeline</string>
+    <string name="lora_setup_body">Adds the Lifeline channel, renames the board so you can spot it on the mesh, marks it unmonitored so other Meshtastic users aren\'t left messaging it, stops it broadcasting its position and node info, and stops it relaying other radios\' traffic. It stays on the public Meshtastic frequency, so other radios can still pass Lifeline messages along.</string>
+    <string name="lora_setup_button">Set up this board for Lifeline</string>
+    <string name="lora_setup_done">Set up for Lifeline — sharing the public Meshtastic frequency, with its own broadcasts quieted.</string>
+    <string name="lora_setup_done_named">Set up for Lifeline as \u201C%1$s\u201D — sharing the public Meshtastic frequency, with its own broadcasts quieted.</string>
+    <string name="lora_setup_restore_button">Undo setup and restore the board\'s settings</string>
+    <string name="lora_setup_rename_button">Rename this board \u201C%1$s\u201D</string>
+    <string name="lora_setup_needs_rename">Set up for Lifeline, but still called \u201C%1$s\u201D on the mesh. Rename it and the board\'s own screen will say so too.</string>
+    <string name="lora_setup_needs_unmonitored">Set up for Lifeline, but the mesh isn\'t told nobody reads it. Lifeline only reads Lifeline\'s own messages, so an ordinary Meshtastic message sent to this board never reaches you.</string>
+    <string name="lora_setup_unmonitored_button">Mark this board unmonitored</string>
+    <string name="lora_custom_primary_warning">This board\'s main channel has been renamed, which puts its radio on a different frequency. Other Lifeline boards won\'t hear it. Set the main channel back to the default in the Meshtastic app.</string>
+    <string name="lora_preset_mismatch_notice">This board is set to %1$s rather than this region\'s usual %2$s. Radios on different presets can\'t hear each other, so every other Lifeline board you want to reach has to be set to %1$s too.</string>
+    <string name="lora_setup_confirm_title">Set this board up for Lifeline?</string>
+    <string name="lora_setup_confirm_body">This adds the Lifeline channel to your board and changes a few of its settings: it renames the board \u201CKnit\u201D so you can pick it out on the mesh, stops broadcasting its position and node info, and stops relaying other radios\' traffic to save battery.\n\nIt also marks the board \u201Cunmonitored\u201D. Lifeline only reads Lifeline\'s own messages, so an ordinary Meshtastic message sent to this board would never reach you \u2014 the mark tells other people\'s apps that, instead of letting them write to a board nobody is reading.\n\nYour board\'s own main channel is left alone and it stays on the public Meshtastic frequency, so other radios can still pass your messages along.\n\nYou can undo this at any time.</string>
+    <string name="lora_setup_confirm_action">Set up</string>
+    <string name="lora_provision_running">Configuring board…</string>
+    <string name="lora_provisioned">Board set up for Lifeline. It may reboot to apply this — it will reconnect on its own.</string>
+    <string name="lora_provision_already">This board is already set up for Lifeline.</string>
+    <string name="lora_provision_no_slot">No free channel slot on the board. Free one in the Meshtastic app, then try again.</string>
+    <!-- Debug builds only (ADR 067): the dedicated-frequency setup. Not shown in any release build. -->
+    <string name="lora_setup_dedicated_button">Set up on a dedicated frequency</string>
+    <string name="lora_setup_dedicated_body">Debug only. Pins the radio to slot %1$d instead of the public Meshtastic frequency.</string>
+    <string name="lora_setup_shared_button">Go back to the shared frequency</string>
+    <string name="lora_setup_dedicated_active">Debug only. This board is on a dedicated frequency, so Lifeline is using the full airtime allowance your region permits. The Meshtastic room is hidden while it stays there, because no public radio can hear it. Going back moves only the radio; the board stays set up for Lifeline.</string>
+    <string name="lora_setup_dedicated_unavailable">Debug only. Lifeline has no dedicated slot for this board\'s region, so this setup is unavailable here.</string>
+    <string name="lora_setup_dedicated_confirm_title">Set this board up on its own frequency?</string>
+    <string name="lora_setup_dedicated_confirm_body">Everything the normal setup does, plus the radio moves to a frequency only Lifeline boards use.\n\nThis is for places with no Meshtastic community nearby. You gain the whole airtime allowance your region permits instead of the tenth Lifeline normally limits itself to \u2014 but no stranger\'s radio will relay your messages any more, so only your own boards carry them.\n\nEvery board in your fleet must be set up this way to talk to the others. You can undo this at any time.</string>
+    <string name="lora_provision_shared">Board back on the shared Meshtastic frequency. It may reboot to apply this — it will reconnect on its own.</string>
+    <string name="lora_provision_no_dedicated_slot">Lifeline won\'t pick a dedicated frequency for this board\'s region. Nothing was changed.</string>
+    <string name="lora_provision_failed">Couldn\'t configure the board. Make sure it\'s connected and try again.</string>
+    <string name="lora_provision_not_ready">Connect to the board first, then set it up.</string>
+    <string name="lora_restored">Board restored to its own name and settings. LoRa is switched off until you set a board up again.</string>
+    <string name="lora_status_connected">Connected</string>
+    <string name="lora_status_connecting">Connecting…</string>
+    <string name="lora_status_reconnecting">Reconnecting…</string>
+    <string name="lora_status_needs_pairing">Pairing needed — re-pair the board in Bluetooth settings</string>
+    <string name="lora_status_bt_off">Bluetooth off or board unavailable</string>
+    <string name="lora_status_off">Not in use</string>
+    <string name="lora_signal">Signal: SNR %1$.1f dB · RSSI %2$d dBm</string>
+    <string name="lora_firmware">Firmware %1$s</string>
+    <string name="lora_battery_percent">Battery %1$d%%</string>
+    <string name="lora_battery_percent_voltage">Battery %1$d%% · %2$.2f V</string>
+    <string name="lora_battery_powered">Plugged in</string>
+    <string name="lora_battery_powered_voltage">Plugged in · %1$.2f V</string>
+    <plurals name="lora_boards_heard">
+        <item quantity="one">%d other radio in range</item>
+        <item quantity="other">%d other radios in range</item>
+    </plurals>
+    <plurals name="lora_peers_heard">
+        <item quantity="one">%d person reachable over LoRa</item>
+        <item quantity="other">%d people reachable over LoRa</item>
+    </plurals>
+    <!-- Bridging distant groups over LoRa (ADR 044). -->
+    <string name="lora_bridge_title">Bridge distant groups</string>
+    <string name="lora_bridge_subtitle">Pass on messages between groups too far apart to reach each other, including ones you did not send, using a small capped share of airtime. Off, you also stop receiving what you missed.</string>
+    <!-- The Meshtastic room: mirroring the board's own primary channel into a room on this phone (ADR 2026-09.26q3). -->
+    <string name="lora_room_title">Meshtastic room</string>
+    <string name="lora_room_subtitle">Show your radio\'s own channel as a room in Lifeline, so you can read and join whatever else is on it. Off, the room is hidden and silent and Lifeline ignores that channel — your board still carries Lifeline\'s own messages.</string>
+    <!-- Debug builds only (ADR 067): the room row's subtitle while the board is on a dedicated frequency. -->
+    <string name="lora_room_subtitle_dedicated">Hidden while this board is on a dedicated frequency: no public radio can hear it, so there is no channel to read. Restore the board to get the room back.</string>
+    <string name="lora_role_passive">Another Lifeline board nearby is bridging — this one is listening</string>
+    <string name="lora_airtime">Airtime %1$d%% of the current budget</string>
+    <string name="lora_radio_config">Radio %1$s</string>
+    <string name="lora_public_channel">Primary channel %1$s</string>
+
+    <string name="lora_summary_off">Off</string>
+    <string name="lora_summary_connected">On · %1$s · connected</string>
+    <string name="lora_summary_connected_battery">On · %1$s · connected · battery %2$d%%</string>
+    <string name="lora_summary_connected_powered">On · %1$s · connected · plugged in</string>
+    <string name="lora_summary_disconnected">On · %1$s · not connected</string>
+    <string name="lora_summary_connecting">On · connecting…</string>
+    <plurals name="relays_scope_count">
+        <item quantity="one">%d conversation</item>
+        <item quantity="other">%d conversations</item>
+    </plurals>
+    <string name="relays_no_photos">Carries messages only — no photos</string>
+    <string name="relays_error_unreachable">Cannot be reached</string>
+    <string name="relays_error_busy">Busy — it is not taking new connections right now</string>
+    <string name="relays_error_auth">Rejected the access token</string>
+    <string name="relays_error_quota">Full — it is holding all it can for this conversation</string>
+    <string name="relays_error_rate">Asking us to slow down</string>
+    <string name="relays_error_pow">Wants more setup work before it accepts this conversation</string>
+    <!-- The socket opened and the relay never spoke (no hello, or it went quiet after one) -->
+    <string name="relays_error_unresponsive">Not answering</string>
+    <!-- The relay's advertised limits cannot carry this app's records (its maxRecord, or an overlong listing) -->
+    <string name="relays_error_incompatible">Not compatible with this version of Lifeline</string>
+    <string name="relays_error_other">Refused a request (%1$s)</string>
+
+    <!-- First-enable consent -->
+    <string name="relays_consent_title">Use Internet relays?</string>
+    <string name="relays_consent_can_title">A relay can see</string>
+    <string name="relays_consent_can_body">Your IP address, and when you send and roughly how much.</string>
+    <string name="relays_consent_cannot_title">A relay cannot see</string>
+    <string name="relays_consent_cannot_body">Your messages or photos, who you are talking to, or who else is in a group.</string>
+    <string name="relays_consent_scope">This applies to every conversation, not just one. You can turn it off at any time; new uploads stop immediately and sealed copies already on a relay expire within 48 hours.</string>
+    <string name="relays_consent_accept">Turn on</string>
+    <string name="relays_consent_decline">Not now</string>
+
+    <!-- Relay invite (docs/RELAY_INVITE.md): the sheet a tapped invite link raises, and the row's share actions -->
+    <string name="relays_invite_title">Relay invite</string>
+    <string name="relays_invite_private">A private relay. The link carries its access key, so only people who were given the link can use it.</string>
+    <string name="relays_invite_room">Joins its room, %1$s. Everyone there becomes a contact, and their messages skip your requests inbox.</string>
+    <string name="relays_invite_room_unnamed">Joins its shared room. Everyone there becomes a contact, and their messages skip your requests inbox.</string>
+    <string name="relays_invite_room_joined">You\'re already in its room.</string>
+    <string name="relays_invite_room_replaces">Replaces the room you joined here. That room and its history leave this phone; the people in it stay in your contacts.</string>
+    <string name="relays_invite_already">Already in your list.</string>
+    <string name="relays_invite_parked">In your list, turned off. This turns it back on.</string>
+    <string name="relays_invite_replaces">Replaces your entry for this relay with one that carries its access key.</string>
+    <string name="relays_invite_sees">This relay will see your IP address and which of your conversations are active, never what is in them.</string>
+    <string name="relays_invite_confirm_add">Add relay</string>
+    <string name="relays_invite_confirm_join">Join room</string>
+    <string name="relays_invite_confirm_turn_on_add">Turn on and add</string>
+    <string name="relays_invite_confirm_turn_on_join">Turn on and join</string>
+    <string name="relays_invite_confirm_noop">OK</string>
+    <string name="relays_invite_decline">Not now</string>
+    <string name="relays_invite_share_desc">Invite others to %1$s</string>
+    <string name="relays_invite_share">Share invite link</string>
+    <string name="relays_invite_copy">Copy invite link</string>
+    <string name="relays_invite_share_text">Join this relay on Lifeline: %1$s</string>
+    <string name="relays_invite_chooser_title">Share relay invite</string>
+    <string name="relays_invite_copied">Invite link copied</string>
+    <string name="relays_invite_refused">That\'s not a Lifeline relay invite.</string>
+    <string name="relays_invite_refused_url">That invite points at a relay this app can\'t use.</string>
+    <string name="relays_invite_applied">Added %1$s</string>
+
+    <!-- Relay reach, shown in a conversation -->
+    <string name="chat_relay_room">Nearby is never sent over the Internet</string>
+    <string name="chat_relay_pending">Not covered by relays yet</string>
+    <string name="chat_relay_room_title">Nearby stays local</string>
+    <string name="chat_relay_room_body">The Nearby room is carried only by Wi-Fi and Bluetooth, by design — it is a public, unencrypted room, so it is never uploaded to a relay.</string>
+    <string name="chat_relay_pending_title">Not covered yet</string>
+    <string name="chat_relay_pending_body">This conversation does not have a relay channel yet. It usually appears on its own once both sides have exchanged encryption keys. Until then, messages travel by Wi-Fi and Bluetooth.</string>
+    <string name="chat_relay_no_fs">This conversation can\'t use relays</string>
+    <string name="chat_relay_no_fs_title">Relays need forward secrecy</string>
+    <string name="chat_relay_no_fs_body">Messages here travel by Wi-Fi and Bluetooth, end-to-end encrypted. Relays carry a direct message only when both sides use forward secrecy, and %1$s\'s version of Lifeline doesn\'t support it.</string>
+    <string name="chat_relay_notice_dismiss">Dismiss</string>
+    <string name="chat_relay_nearby_only">Nearby only</string>
+    <string name="chat_relay_nearby_only_desc">Attachment will not be sent over the Internet</string>
+    <string name="chat_relay_too_large_title">Too large for your relays</string>
+    <string name="chat_relay_too_large_body">This attachment is bigger than any of your relays will hold, so it is not being uploaded. It still arrives when you and %1$s are in Wi-Fi or Bluetooth range of each other.</string>
+    <string name="chat_relay_unsupported_title">Your relays carry messages only</string>
+    <string name="chat_relay_unsupported_body">None of your relays accepts attachments, so this one is not being uploaded. It still arrives when you and %1$s are in Wi-Fi or Bluetooth range of each other.</string>
+    <string name="chat_relay_staged_too_large">Nearby only — too large for your relays</string>
+    <string name="chat_relay_staged_unsupported">Nearby only — your relays carry messages only</string>
+    <!-- LoRa plane (ADR 040): a DM whose peer only the board has heard lately, and the composer's length hint -->
+    <string name="chat_lora_only">Reachable over LoRa only</string>
+    <string name="chat_lora_only_title">Over LoRa only</string>
+    <string name="chat_lora_only_body">%1$s was last heard over the LoRa radio, not Wi-Fi or Bluetooth. Messages arrive slowly, long ones may not arrive, and photos are not sent until you are in radio range.</string>
+    <string name="chat_lora_only_dms_off">In LoRa range only — private messages over LoRa are off</string>
+    <string name="chat_lora_only_dms_off_title">Private messages over LoRa are off</string>
+    <string name="chat_lora_only_dms_off_body">%1$s was last heard over the LoRa radio, not Wi-Fi or Bluetooth, and private messages are set to stay on the phone-to-phone radios. Turn on “Private messages over LoRa” in LoRa radio settings to reach them now.</string>
+    <string name="chat_lora_saturated">Over LoRa only — airtime is used up, messages are delayed</string>
+    <string name="chat_lora_saturated_title">LoRa airtime is used up</string>
+    <string name="chat_lora_saturated_body">%1$s can only be reached over the LoRa radio, and the radio has used its share of the airwaves for now. New messages wait their turn and arrive over the next few minutes; delivery ticks may take longer still.</string>
+    <!-- The room's only LoRa notice: it is a mixed audience, so this names nobody and says what still works. -->
+    <string name="chat_lora_room_saturated">LoRa airtime is used up — posts are slow to reach distant people</string>
+    <string name="chat_lora_room_saturated_title">LoRa airtime is used up</string>
+    <string name="chat_lora_room_saturated_body">Some people here were last heard over the LoRa radio, and the radio has used its share of the airwaves for now. Everyone in Wi-Fi or Bluetooth range still gets your posts straight away; posts to the distant ones wait their turn and arrive over the next few minutes.</string>
+    <!-- A group thread: the plane refuses group-form frames, so this is a capability, not congestion. -->
+    <string name="chat_lora_group">Group chats don\'t travel over LoRa — distant members get these later</string>
+    <string name="chat_lora_group_title">Group chats don\'t travel over LoRa</string>
+    <string name="chat_lora_group_body">The LoRa radio carries the Nearby room and private messages, not group chats. Someone here was last heard over LoRa, so they won\'t see these messages until they are back in Wi-Fi or Bluetooth range, or reachable through an Internet relay. Nothing is lost — the messages wait for them.</string>
+    <string name="chat_lora_long_message">Long message — it may not reach people over LoRa</string>
+
+    <!-- The Meshtastic room: the paired radio's primary channel, and who to believe about the names on it -->
+    <string name="chat_mesh_author">%1$s, on the Meshtastic channel</string>
+    <!-- A heard author whose node number matches a contact's profile: the avatar is tappable, but it opens
+         the caveat first rather than the profile, because the match is a self-asserted field, not a signature. -->
+    <string name="chat_mesh_author_contact">%1$s, on the Meshtastic channel \u2014 identity not verified</string>
+    <string name="chat_mesh_author_action">Show why this name isn\'t verified</string>
+    <string name="chat_mesh_author_verified">%1$s, on the Meshtastic channel \u2014 signed by their radio</string>
+    <string name="chat_mesh_signed_by_radio">Signed by %1$s\'s radio</string>
+    <string name="chat_mesh_signed">signed</string>
+    <string name="chat_mesh_signature_mismatch">signature doesn\'t match</string>
+    <string name="chat_mesh_match_title">Might not be %1$s</string>
+    <string name="chat_mesh_match_body">%1$s\'s profile says they use this radio, and this post came from that radio\'s number. That is the whole match: it carried no signature Lifeline could check against that profile. Any radio can announce that number and any name, so Lifeline has no way to check that %1$s wrote this one. Open their profile if it helps, but read it as a guess about who spoke, not a fact.</string>
+    <string name="chat_mesh_match_open">Open profile</string>
+    <string name="chat_mesh_direct">heard directly</string>
+    <plurals name="chat_mesh_hops">
+        <item quantity="one">%d hop away</item>
+        <item quantity="other">%d hops away</item>
+    </plurals>
+    <string name="chat_mesh_snr">SNR %1$.1f dB</string>
+    <string name="chat_mesh_mqtt">from the Internet</string>
+    <!-- Two forms, picked off slot 0's key: the stock Meshtastic key is public, so that channel is open to
+         everyone; a key the user set themselves is still shared with every radio holding it, never end-to-end. -->
+    <string name="chat_mesh_room_notice">Unencrypted radio channel — names not verified unless marked</string>
+    <string name="chat_mesh_room_notice_keyed">Not end-to-end encrypted — names not verified unless marked</string>
+    <string name="chat_mesh_room_title">Your radio\'s primary channel</string>
+    <string name="chat_mesh_room_body">This room shows the primary channel of the Meshtastic radio paired to this phone. Lifeline\'s encryption does not reach it: nothing here is end-to-end encrypted, and on the standard Meshtastic channel the key is public, so anyone with a radio can read it. Anyone with a radio in range can post and anyone can claim any name, so treat both as unverified, even a name that matches one of your contacts. The one exception is a contact\'s name with a shield beside it: their radio signed that post, and the signature checked out against the radio their profile names. A matching name without the shield is still a guess. Some posts arrive from the Internet rather than from anyone nearby. What you post here leaves through your own radio, under the radio\'s name rather than yours.</string>
+    <string name="chat_mesh_hint">Post unencrypted to the radio channel</string>
+    <string name="chat_mesh_hint_keyed">Post to the radio channel, not end-to-end encrypted</string>
+    <!-- The composer when the room has no radio to post through, or the radio is down. The first two replace
+         the field; the third is only a hint, because a link that flaps on every Bluetooth reconnect must not
+         take the keyboard away mid-sentence. -->
+    <string name="chat_mesh_no_radio">Pair a Meshtastic radio to post here. This room is your own radio\'s primary channel.</string>
+    <string name="chat_mesh_channel_unusable">This radio\'s primary channel can\'t take posts. Check its channels in the Meshtastic app.</string>
+    <string name="chat_mesh_radio_down">Connect your radio to post</string>
+    <string name="chat_mesh_empty">Nothing heard on this channel yet.</string>
+    <!-- Why a post did not leave, said once as a toast; the draft stays. -->
+    <string name="chat_mesh_post_not_connected">Not posted — your radio isn\'t connected</string>
+    <string name="chat_mesh_post_too_soon">Not posted — one post every 30 seconds. Try again shortly.</string>
+    <string name="chat_mesh_post_too_large">Not posted — too long for one radio packet</string>
+    <string name="chat_mesh_post_no_air">Not posted — the radio has used its airtime for now. Try again in a few minutes.</string>
+    <string name="chat_mesh_post_channel_unusable">Not posted — this radio\'s primary channel can\'t take posts</string>
+    <string name="chat_mesh_post_refused">Not posted — the radio refused it. Try again.</string>
+    <string name="chat_mesh_post_room_off">Not posted — the Meshtastic room is switched off in LoRa settings</string>
+    <string name="chat_mesh_post_dedicated">Not posted — this radio is on a dedicated frequency, where no public channel can hear it</string>
+    <!-- The composer's length counter as a post nears the Meshtastic frame's limit, and the refusal for
+         anything that is not text. The channel carries one short line: the cap is hard, so the counter shows
+         what is used out of what there is rather than warning after the fact. The spoken form is separate
+         because "183/193" is read aloud as a fraction. -->
+    <string name="chat_mesh_post_length">%1$d/%2$d</string>
+    <string name="chat_mesh_post_length_a11y">Post length: %1$d of %2$d</string>
+    <string name="chat_mesh_text_only">The radio channel carries text only</string>
+    <string name="chat_commons_text_only">The commons carries text only</string>
+    <string name="chat_commons_not_joined">Not sent: this phone is no longer in this commons</string>
+    <string name="chat_mesh_consent_title">Post to the radio channel?</string>
+    <string name="chat_mesh_consent_can_title">Who can see this</string>
+    <string name="chat_mesh_consent_can_body">Anyone with a Meshtastic radio in range. Many radios also pass this channel on to a public Internet server, where it is stored by people you will never meet.</string>
+    <string name="chat_mesh_consent_cannot_title">What does not go out</string>
+    <string name="chat_mesh_consent_cannot_body">Your picture, your contacts, and everything in your other conversations. Those stay on Lifeline\'s own channel.</string>
+    <string name="chat_mesh_consent_scope">Your Lifeline name stays off the air — a post goes out under your radio\'s name, “Knit” and four characters. A contact whose phone already knows that radio still sees the post as yours.</string>
+    <string name="chat_mesh_consent_accept">Post</string>
+    <string name="chat_mesh_consent_decline">Not now</string>
+    <string name="chat_mesh_subtitle">Your radio\'s primary channel</string>
+    <string name="chat_commons_subtitle">Everyone on this relay</string>
+
+    <!-- Message details ("Message info", from a message's long-press menu) -->
+    <string name="message_details_title">Message info</string>
+    <string name="message_details_sent_by">Sent by %1$s</string>
+    <!-- Local-clock stamps, beside the sender's own sent time: when a message we received landed here, and
+         when a DM we sent reached them. Labelled in words because the line above them is a bare timestamp. -->
+    <string name="message_details_arrived_at">Arrived %1$s</string>
+    <string name="message_details_delivered_at">Delivered %1$s</string>
+    <string name="message_details_hidden_body">Message hidden by content filtering</string>
+    <string name="message_details_no_reactions">No one has reacted to this message yet</string>
+    <string name="message_details_filter_all">All %1$d</string>
+    <string name="message_details_filter_emoji">%1$s %2$d</string>
+    <!-- Per-recipient delivery, on a group message you sent -->
+    <string name="message_details_delivered_to">Delivered to</string>
+    <string name="message_details_waiting_on">Waiting on</string>
+    <!-- The broadcast room has no roster, so its list is who answered, never everyone who received it -->
+    <string name="message_details_confirmed_delivered_to">Confirmed delivered to</string>
+    <string name="message_details_room_open_list">The room has no member list. This is who your phone has heard back from, and others in range may have received it too.</string>
+    <!-- Row content descriptions: a section header is not announced with the rows under it -->
+    <string name="message_details_recipient_delivered">%1$s, delivered %2$s</string>
+    <string name="message_details_recipient_waiting">%1$s, not delivered yet</string>
+</resources>
